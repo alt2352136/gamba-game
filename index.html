@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#100d19">
+  <meta name="description" content="gamba - crash game">
+  <title>gamba - crash game</title>
+  <link rel="icon" type="image/png" href="honk-icon.png">
+  <link rel="apple-touch-icon" href="honk-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="game.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="gamba crash game">
+        <img class="brand-icon" src="honk-icon.png" alt="">
+        <span class="brand-name">gamba <span>/ crash game</span></span>
+      </a>
+
+      <div class="wallet" aria-live="polite" aria-label="Gold balance">
+        <span class="coin-icon" aria-hidden="true">G</span>
+        <span class="wallet-balance"><strong id="balance">888</strong><small>GOLD</small></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="game-layout" aria-label="Crash game">
+        <section class="game-panel panel" aria-label="Current round">
+          <div class="game-panel-header">
+            <span class="section-label">CRASH GAME</span>
+            <span class="round-status" id="round-status">READY</span>
+          </div>
+
+          <div class="multiplier-area" aria-live="polite">
+            <div class="multiplier-value" id="multiplier">x1.00</div>
+            <p class="multiplier-caption" id="multiplier-caption">Hold to start. Release to cash out.</p>
+          </div>
+
+          <div class="meter-wrap">
+            <div class="meter-track" id="meter-track" role="progressbar" aria-label="Multiplier progress toward x10" aria-valuemin="1" aria-valuemax="10" aria-valuenow="1">
+              <div class="meter-fill" id="meter-fill"></div>
+              <span class="meter-wobble" id="meter-wobble" aria-hidden="true"></span>
+            </div>
+            <div class="meter-labels"><span>x1.00</span><span>x5.00</span><span>x10.00</span></div>
+          </div>
+
+          <p class="round-message" id="round-message" role="status">Place a bet, then hold the button to start.</p>
+
+          <button class="hold-button" id="hold-button" type="button" aria-pressed="false">
+            <span class="hold-button-title" id="hold-button-title">HOLD TO START</span>
+            <span class="hold-button-subtitle" id="hold-button-subtitle">Release to cash out</span>
+          </button>
+          <p class="hold-hint">PRESS AND HOLD <span>·</span> RELEASE TO CASH OUT</p>
+
+          <div class="game-panel-footer">
+            <span>Multiplier growth <strong>0.8x / sec</strong></span>
+            <span>Maximum <strong>x10.00</strong></span>
+          </div>
+        </section>
+
+        <aside class="side-column">
+          <section class="bet-panel panel" aria-labelledby="bet-heading">
+            <div class="panel-heading">
+              <h2 id="bet-heading">Bet amount</h2>
+              <span class="heading-unit">GOLD</span>
+            </div>
+
+            <label class="field-label" for="bet-input">Your stake</label>
+            <div class="bet-input-wrap">
+              <input id="bet-input" type="number" inputmode="numeric" min="1" max="888" step="1" value="88" autocomplete="off">
+              <button class="max-button" id="max-button" type="button">MAX</button>
+            </div>
+            <div class="quick-bets" aria-label="Quick bet amounts">
+              <button type="button" data-fraction="0.25">25%</button>
+              <button type="button" data-fraction="0.5">50%</button>
+              <button type="button" data-fraction="0.75">75%</button>
+              <button type="button" data-fraction="1">ALL IN</button>
+            </div>
+            <p class="field-note" id="bet-note">Your stake is deducted when the round starts.</p>
+          </section>
+
+          <section class="loan-panel panel" aria-labelledby="loan-panel-heading">
+            <div class="panel-heading">
+              <h2 id="loan-panel-heading">Bank loan</h2>
+              <span class="loan-status" id="loan-status">NONE</span>
+            </div>
+            <div class="loan-summary">
+              <span id="loan-description">No active loans</span>
+              <strong id="loan-rounds">—</strong>
+            </div>
+            <div class="loan-availability" aria-label="Loan availability this game">
+              <div class="loan-availability-row" data-loan-status="444">
+                <span class="loan-availability-main"><strong>444 gold</strong><small>Repay 533 · 8 rounds</small></span>
+                <span class="loan-availability-state" id="loan-444-state">AVAILABLE</span>
+              </div>
+              <div class="loan-availability-row" data-loan-status="888">
+                <span class="loan-availability-main"><strong>888 gold</strong><small>Repay 1,110 · 6 rounds</small></span>
+                <span class="loan-availability-state" id="loan-888-state">AVAILABLE</span>
+              </div>
+              <div class="loan-availability-row" data-loan-status="1500">
+                <span class="loan-availability-main"><strong>1,500 gold</strong><small>Repay 2,025 · 4 rounds</small></span>
+                <span class="loan-availability-state" id="loan-1500-state">AVAILABLE</span>
+              </div>
+            </div>
+            <p class="field-note">Loans unlock at 0 gold. Each can be used once per game.</p>
+          </section>
+
+          <section class="history-panel panel" aria-labelledby="history-heading">
+            <div class="panel-heading">
+              <h2 id="history-heading">Recent rounds</h2>
+              <span class="heading-unit">LAST 5</span>
+            </div>
+            <div class="history-list" id="history-list">
+              <p class="history-empty">Completed rounds will appear here.</p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="bankrupt-modal" role="dialog" aria-modal="true" aria-labelledby="bankrupt-title">
+    <section class="modal-card">
+      <p class="modal-kicker">BALANCE: 0 GOLD</p>
+      <h2 id="bankrupt-title">No gold left</h2>
+      <p class="modal-copy" id="bankrupt-copy">Take a loan to continue, or end this game.</p>
+      <div class="modal-actions">
+        <button class="button-secondary" id="accept-defeat-button" type="button">Accept defeat</button>
+        <button class="button-primary" id="bank-loan-button" type="button">Bank loan</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop hidden" id="loan-modal" role="dialog" aria-modal="true" aria-labelledby="loan-title">
+    <section class="modal-card loan-modal-card">
+      <button class="modal-close" id="loan-close-button" type="button" aria-label="Close loan window">×</button>
+      <p class="modal-kicker">CREDIT</p>
+      <h2 id="loan-title">Choose a loan</h2>
+      <p class="modal-copy">Each loan can be taken once per game. Existing repayment deadlines continue if you borrow again. Repayments are collected after a round when your balance covers them.</p>
+
+      <div class="loan-options">
+        <button class="loan-option" type="button" data-loan="444">
+          <span class="loan-option-top"><strong>444 <small>GOLD</small></strong><span class="loan-tier">STARTER</span></span>
+          <span class="loan-option-repay">Repay <strong>533 gold</strong></span>
+          <span class="loan-option-details"><span>20% fee</span><span>8 rounds</span></span>
+        </button>
+        <button class="loan-option" type="button" data-loan="888">
+          <span class="loan-option-top"><strong>888 <small>GOLD</small></strong><span class="loan-tier">STANDARD</span></span>
+          <span class="loan-option-repay">Repay <strong>1,110 gold</strong></span>
+          <span class="loan-option-details"><span>25% fee</span><span>6 rounds</span></span>
+        </button>
+        <button class="loan-option" type="button" data-loan="1500">
+          <span class="loan-option-top"><strong>1,500 <small>GOLD</small></strong><span class="loan-tier">HIGHER RISK</span></span>
+          <span class="loan-option-repay">Repay <strong>2,025 gold</strong></span>
+          <span class="loan-option-details"><span>35% fee</span><span>4 rounds</span></span>
+        </button>
+      </div>
+      <p class="loan-warning" id="loan-warning">Larger loans have higher fees and shorter repayment deadlines.</p>
+    </section>
+  </div>
+
+  <div class="modal-backdrop hidden" id="gameover-modal" role="dialog" aria-modal="true" aria-labelledby="gameover-title">
+    <section class="modal-card gameover-card">
+      <p class="modal-kicker" id="gameover-eyebrow">GAME OVER</p>
+      <h2 id="gameover-title">Game over</h2>
+      <p class="modal-copy" id="gameover-copy">This game has ended.</p>
+      <div class="final-balance"><span>FINAL BALANCE</span><strong id="final-balance">0 GOLD</strong></div>
+      <button class="button-primary full-button" id="new-game-button" type="button">Start new game</button>
+    </section>
+  </div>
+</body>
+</html>
