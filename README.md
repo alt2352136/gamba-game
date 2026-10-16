@@ -35,6 +35,7 @@ Before using a server seed, the backend publishes its SHA-256 commitment. When t
 - **Unattended lifecycle:** Durable Object alarms settle rounds without depending on a connected browser.
 - **Numerical determinism:** fixed 52-bit input and integer division keep cent rounding reproducible across clients.
 - **Low-overhead cosmic background:** the Canvas dust field is rasterized at startup or resize, then moved with a slow CSS transform instead of a JavaScript particle loop. Temporary particle records are discarded after painting; reduced-motion preferences disable the drift, and star trails remain on their own layer.
+- **Bounded frontend requests:** API calls time out even while a response body is being read. Retried mutations reuse the same idempotency key, and a later round start repairs a missing client seed after a partially completed reset. If a cash-out response is uncertain, status polling resumes until the server settles the round.
 
 ## Run locally
 

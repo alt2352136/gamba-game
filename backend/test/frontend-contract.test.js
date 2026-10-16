@@ -69,3 +69,31 @@ test("round settlement chooses one modal path per server response", () => {
   assert.match(match[1], /applyState\(response\.state, response\.profile, \{ updateModals: false \}\)/);
   assert.match(match[1], /if \(response\.defaultedLoan \|\| response\.state\.gameOver\)[\s\S]*?else if \(response\.state\.waitingForLoan && response\.state\.balance <= 0\)[\s\S]*?else \{/);
 });
+
+
+test("API requests have a bounded timeout that also covers reading the response body", () => {
+  assert.match(js, /const API_REQUEST_TIMEOUT_MS = 12_000/);
+  assert.match(js, /new AbortController\(\)/);
+  assert.match(js, /text = await response\.text\(\);/);
+  assert.match(js, /controller\.abort\(\)/);
+  assert.match(js, /if \(timeoutId !== null\) clearTimeout\(timeoutId\)/);
+  assert.match(js, /const maxAttempts = options\.idempotencyKey \? 2 : 1/);
+});
+
+
+test("a round start repairs a missing client seed before contacting the start endpoint", () => {
+  const start = js.indexOf("async function startRound(source, identifier = null)");
+  const end = js.indexOf("async function finishFromServerResult", start);
+  assert.ok(start >= 0 && end > start, "Round start should remain a self-contained flow");
+  const body = js.slice(start, end);
+  assert.ok(body.indexOf("await ensureClientSeed();") >= 0);
+  assert.ok(body.indexOf("await ensureClientSeed();") < body.indexOf('api("/api/round/start"'));
+});
+
+test("an uncertain cash-out result resumes status polling if the round is still active", () => {
+  const start = js.indexOf("async function cashOut()");
+  const end = js.indexOf("function releaseHold", start);
+  assert.ok(start >= 0 && end > start, "Cash-out should remain a self-contained flow");
+  const body = js.slice(start, end);
+  assert.match(body, /await pollRoundStatus\(\);\s*if \(game\.active && !game\.cashoutPending\) scheduleStatusPoll\(\);/);
+});

@@ -14,6 +14,7 @@
   const MAX_MULTIPLIER = 10;
   // Lower request traffic; the server alarm settles rounds even when no browser is connected.
   const STATUS_POLL_MS = 1000;
+  const API_REQUEST_TIMEOUT_MS = 12_000;
   const LOANS = {
     444: { principal: 444, repayment: 533, rounds: 8, tier: "STARTER" },
     888: { principal: 888, repayment: 1110, rounds: 6, tier: "STANDARD" },
@@ -213,15 +214,29 @@
     let lastNetworkError = null;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let response;
+      let text;
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const timeoutId = controller
+        ? setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
+        : null;
       try {
-        response = await fetch(`${API_BASE}${path}`, requestOptions);
+        response = await fetch(`${API_BASE}${path}`, {
+          ...requestOptions,
+          ...(controller ? { signal: controller.signal } : {})
+        });
+        // Keep the timeout active while reading the body too, not just until headers arrive.
+        text = await response.text();
       } catch (error) {
         lastNetworkError = error;
         if (attempt + 1 < maxAttempts) continue; // Retry only idempotent actions with the same key.
+        if (error?.name === "AbortError") {
+          throw new Error("The game server took too long to respond. Check your connection and try again.");
+        }
         throw new Error("Couldn't reach the game server. Check your connection and try again.");
+      } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
       }
 
-      const text = await response.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch { /* keep text for the error */ }
       if (!response.ok) throw new ApiError(response.status, data, text);
@@ -710,6 +725,9 @@
 
     const idempotencyKey = newIdempotencyKey();
     try {
+      // A previous reset may have succeeded even if registering its client seed timed out.
+      // Repair that state before attempting to create a round.
+      await ensureClientSeed();
       const response = await api("/api/round/start", { method: "POST", body: { stake }, idempotencyKey });
       game.startPending = false;
       game.activeBet = response.round.stake;
@@ -875,6 +893,7 @@
       setRoundStatus("CHECKING");
       setMessage(`Cash-out wasn't confirmed yet. Checking the round state. ${error.message}`, "danger");
       await pollRoundStatus();
+      if (game.active && !game.cashoutPending) scheduleStatusPoll();
     }
   }
 
