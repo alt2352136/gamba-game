@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport"/>
+  <meta content="#0c0b18" name="theme-color"/>
+  <meta content="A browser-based crash game with server-authoritative rounds and verifiable outcomes." name="description"/>
+  <meta content="no-referrer" name="referrer"/>
+  <meta content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self' https://gamba-crash-backend.gamba-crash-game.workers.dev; object-src 'none'; base-uri 'self'; form-action 'self'" http-equiv="Content-Security-Policy"/>
+  <title>
+   gamba &mdash; crash game
+  </title>
+  <link href="honk-icon.png" rel="icon" type="image/png"/>
+  <link href="honk-icon.png" rel="apple-touch-icon"/>
+  <link href="styles.css" rel="stylesheet"/>
+  <script defer="" src="backend-config.js">
+  </script>
+  <script defer="" src="game.js">
+  </script>
+ </head>
+ <body>
+  <a class="skip-link" href="#main-content">
+   Skip to game
+  </a>
+  <div class="app-shell">
+   <header class="topbar">
+    <a aria-label="gamba crash game" class="brand" href="#">
+     <img alt="" class="brand-icon" src="honk-icon.png"/>
+     <span class="brand-name">
+      gamba
+      <span>
+       / crash game
+      </span>
+     </span>
+    </a>
+    <div aria-label="Gold balance" aria-live="polite" class="wallet">
+     <span aria-hidden="true" class="coin-icon">
+      G
+     </span>
+     <span class="wallet-balance">
+      <strong id="balance">
+       888
+      </strong>
+      <small>
+       GOLD
+      </small>
+     </span>
+    </div>
+   </header>
+   <main id="main-content">
+    <section aria-label="Crash game" class="game-layout">
+     <aside aria-label="Personal records and fairness verification" class="left-column">
+      <section aria-labelledby="leaderboard-heading" class="leaderboard-panel panel">
+       <div class="panel-heading">
+        <h2 id="leaderboard-heading">
+         Personal bests
+        </h2>
+        <span class="heading-unit">
+         TOP 5 PAYOUTS
+        </span>
+       </div>
+       <div class="leaderboard-list" id="leaderboard-list">
+        <p class="history-empty">
+         Your best cash-outs will appear here.
+        </p>
+       </div>
+       <p class="field-note">
+        Your five highest payouts in this browser profile. Not a public ranking.
+       </p>
+      </section>
+      <details aria-labelledby="fairness-heading" class="fairness-panel panel">
+       <summary class="fairness-panel-summary">
+        <h2 class="fairness-summary-title" id="fairness-heading">Fairness &amp; verification</h2>
+        <span class="heading-unit" id="fairness-epoch" title="The current server seed is committed before its rounds begin.">CURRENT SEED</span>
+        <span aria-hidden="true" class="fairness-chevron">+</span>
+       </summary>
+       <div class="fairness-content">
+        <p class="fairness-intro" id="fairness-message">No action needed to play. Open this panel to verify results after a seed is revealed.</p>
+        <p class="fairness-label">Server commitment · SHA-256</p>
+        <code class="fairness-value" id="fairness-commitment">Waiting for commitment…</code>
+        <button class="button-secondary full-button" disabled id="copy-commitment-button" type="button">Copy commitment</button>
+        <p class="fairness-label">Client seed · public</p>
+        <code class="fairness-value" id="fairness-client-seed">Client seed not set</code>
+        <button class="button-secondary full-button fairness-verify-button" disabled id="verify-fairness-button" type="button">Verify past rounds</button>
+        <p aria-live="polite" class="fairness-verification" id="verify-fairness-status">Checks revealed seeds and recorded rounds.</p>
+        <details class="fairness-help">
+         <summary>How it works</summary>
+         <p>The server commits to a hidden seed before play. After revealing it, this check compares its hash and recalculates recorded crash points. It verifies recorded rounds, not whether any were omitted.</p>
+        </details>
+        <details hidden id="last-reveal-panel">
+         <summary>Previous seed revealed</summary>
+         <p class="fairness-label" id="last-reveal-epoch">Previous seed · batch</p>
+         <p class="fairness-label">Server seed</p>
+         <code class="fairness-value" id="last-reveal-seed"></code>
+         <p class="fairness-label">Original commitment</p>
+         <code class="fairness-value" id="last-reveal-commitment"></code>
+        </details>
+       </div>
+      </details>
+     </aside>
+     <section aria-label="Current round" class="game-panel panel">
+      <div class="game-starfield" aria-hidden="true">
+       <canvas class="galaxy-particles" aria-hidden="true"></canvas>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+       <span class="star-trail"></span>
+      </div>
+      <div class="game-panel-header">
+       <span class="section-label">
+        CRASH GAME
+       </span>
+       <span class="round-status" id="round-status">
+        READY
+       </span>
+      </div>
+      <div aria-live="polite" class="multiplier-area">
+       <div class="multiplier-value" id="multiplier">
+        x1.00
+       </div>
+       <p class="multiplier-caption" id="multiplier-caption">
+        Hold to start. Release to cash out.
+       </p>
+      </div>
+      <div class="meter-wrap">
+       <div aria-label="Multiplier progress toward x10" aria-valuemax="10" aria-valuemin="1" aria-valuenow="1" class="meter-track" id="meter-track" role="progressbar">
+        <div class="meter-fill" id="meter-fill">
+        </div>
+        <span aria-hidden="true" class="meter-wobble" id="meter-wobble">
+        </span>
+       </div>
+       <div class="meter-labels">
+        <span>
+         x1.00
+        </span>
+        <span>
+         x5.00
+        </span>
+        <span>
+         x10.00
+        </span>
+       </div>
+      </div>
+      <p class="round-message" id="round-message" role="status">
+       Place a bet, then hold the button to start.
+      </p>
+      <button aria-pressed="false" class="hold-button" id="hold-button" type="button">
+       <span class="hold-button-title" id="hold-button-title">
+        HOLD TO START
+       </span>
+       <span class="hold-button-subtitle" id="hold-button-subtitle">
+        Release to cash out
+       </span>
+      </button>
+      <p class="hold-hint">
+       PRESS AND HOLD
+       <span>
+        &middot;
+       </span>
+       RELEASE TO CASH OUT
+      </p>
+      <div class="game-panel-footer">
+       <span>
+        Multiplier growth
+        <strong>
+         0.8x / sec
+        </strong>
+       </span>
+       <span>
+        Maximum
+        <strong>
+         x10.00
+        </strong>
+       </span>
+      </div>
+     </section>
+     <aside class="side-column">
+      <section aria-labelledby="bet-heading" class="bet-panel panel">
+       <div class="panel-heading">
+        <h2 id="bet-heading">
+         Bet amount
+        </h2>
+        <span class="heading-unit">
+         GOLD
+        </span>
+       </div>
+       <label class="field-label" for="bet-input">
+        Your stake
+       </label>
+       <div class="bet-input-wrap">
+        <input autocomplete="off" id="bet-input" inputmode="numeric" max="888" min="1" step="1" type="number" value="88"/>
+        <button class="max-button" id="max-button" type="button">
+         MAX
+        </button>
+       </div>
+       <div aria-label="Quick bet amounts" class="quick-bets">
+        <button data-fraction="0.25" type="button">
+         25%
+        </button>
+        <button data-fraction="0.5" type="button">
+         50%
+        </button>
+        <button data-fraction="0.75" type="button">
+         75%
+        </button>
+        <button data-fraction="1" type="button">
+         ALL IN
+        </button>
+       </div>
+       <p class="field-note" id="bet-note">
+        Your stake is deducted when the round starts.
+       </p>
+      </section>
+      <section aria-labelledby="loan-panel-heading" class="loan-panel panel">
+       <div class="panel-heading">
+        <h2 id="loan-panel-heading">
+         Bank loan
+        </h2>
+        <span class="loan-status" id="loan-status">
+         NONE
+        </span>
+       </div>
+       <div class="loan-summary">
+        <span id="loan-description">
+         No active loans
+        </span>
+        <strong id="loan-rounds">
+         &mdash;
+        </strong>
+       </div>
+       <div aria-label="Loan availability this game" class="loan-availability">
+        <div class="loan-availability-row" data-loan-status="444">
+         <span class="loan-availability-main">
+          <strong>
+           444 gold
+          </strong>
+          <small>
+           Repay 533 &middot; 8 rounds
+          </small>
+         </span>
+         <span class="loan-availability-state" id="loan-444-state">
+          AVAILABLE
+         </span>
+        </div>
+        <div class="loan-availability-row" data-loan-status="888">
+         <span class="loan-availability-main">
+          <strong>
+           888 gold
+          </strong>
+          <small>
+           Repay 1,110 &middot; 6 rounds
+          </small>
+         </span>
+         <span class="loan-availability-state" id="loan-888-state">
+          AVAILABLE
+         </span>
+        </div>
+        <div class="loan-availability-row" data-loan-status="1500">
+         <span class="loan-availability-main">
+          <strong>
+           1,500 gold
+          </strong>
+          <small>
+           Repay 2,025 &middot; 4 rounds
+          </small>
+         </span>
+         <span class="loan-availability-state" id="loan-1500-state">
+          AVAILABLE
+         </span>
+        </div>
+       </div>
+       <p class="field-note">
+        Loans unlock at 0 gold. Each can be used once per game.
+       </p>
+      </section>
+      <section aria-labelledby="history-heading" class="history-panel panel">
+       <div class="panel-heading">
+        <h2 id="history-heading">
+         Recent rounds
+        </h2>
+        <span class="heading-unit">
+         LAST 10
+        </span>
+       </div>
+       <div class="history-list" id="history-list">
+        <p class="history-empty">
+         Completed rounds will appear here.
+        </p>
+       </div>
+      </section>
+     </aside>
+    </section>
+    <section aria-label="Session records" class="insights-layout">
+     <section aria-labelledby="stats-heading" class="stats-panel panel">
+      <div class="panel-heading">
+       <h2 id="stats-heading">
+        Game statistics
+       </h2>
+       <span class="heading-unit">
+        SAVED IN THIS BROWSER
+       </span>
+      </div>
+      <div class="stats-grid">
+       <div class="stat-tile">
+        <span>
+         Rounds
+        </span>
+        <strong id="stat-rounds">
+         0
+        </strong>
+       </div>
+       <div class="stat-tile">
+        <span>
+         Win rate
+        </span>
+        <strong id="stat-win-rate">
+         0.0%
+        </strong>
+       </div>
+       <div class="stat-tile">
+        <span>
+         Net result
+        </span>
+        <strong class="positive" id="stat-net-result">
+         +0
+        </strong>
+       </div>
+       <div class="stat-tile">
+        <span>
+         Best cash-out
+        </span>
+        <strong id="stat-best-multiplier">
+         x1.00
+        </strong>
+       </div>
+       <div class="stat-tile">
+        <span>
+         Total staked
+        </span>
+        <strong id="stat-total-staked">
+         0
+        </strong>
+       </div>
+       <div class="stat-tile">
+        <span>
+         Total payouts
+        </span>
+        <strong id="stat-total-payout">
+         0
+        </strong>
+       </div>
+      </div>
+      <p class="field-note">
+       Saved to this browser. Come back anytime.
+      </p>
+     </section>
+    </section>
+    <footer class="site-footer">
+     <span>gamba / crash game</span>
+    </footer>
+   </main>
+  </div>
+  <div aria-labelledby="bankrupt-title" aria-modal="true" class="modal-backdrop hidden" id="bankrupt-modal" role="dialog">
+   <section class="modal-card">
+    <p class="modal-kicker">
+     BALANCE: 0 GOLD
+    </p>
+    <h2 id="bankrupt-title">
+     No gold left
+    </h2>
+    <p class="modal-copy" id="bankrupt-copy">
+     Take a loan to continue, or end this game.
+    </p>
+    <div class="modal-actions">
+     <button class="button-secondary" id="accept-defeat-button" type="button">
+      Accept defeat
+     </button>
+     <button class="button-primary" id="bank-loan-button" type="button">
+      Bank loan
+     </button>
+    </div>
+   </section>
+  </div>
+  <div aria-labelledby="loan-title" aria-modal="true" class="modal-backdrop hidden" id="loan-modal" role="dialog">
+   <section class="modal-card loan-modal-card">
+    <button aria-label="Close loan window" class="modal-close" id="loan-close-button" type="button">
+     &times;
+    </button>
+    <p class="modal-kicker">
+     CREDIT
+    </p>
+    <h2 id="loan-title">
+     Choose a loan
+    </h2>
+    <p class="modal-copy">
+     Each loan can be taken once per game. Existing repayment deadlines continue if you borrow again. Repayments are collected after a round when your balance covers them.
+    </p>
+    <div class="loan-options">
+     <button class="loan-option" data-loan="444" type="button">
+      <span class="loan-option-top">
+       <strong>
+        444
+        <small>
+         GOLD
+        </small>
+       </strong>
+       <span class="loan-tier">
+        STARTER
+       </span>
+      </span>
+      <span class="loan-option-repay">
+       Repay
+       <strong>
+        533 gold
+       </strong>
+      </span>
+      <span class="loan-option-details">
+       <span>
+        20% fee
+       </span>
+       <span>
+        8 rounds
+       </span>
+      </span>
+     </button>
+     <button class="loan-option" data-loan="888" type="button">
+      <span class="loan-option-top">
+       <strong>
+        888
+        <small>
+         GOLD
+        </small>
+       </strong>
+       <span class="loan-tier">
+        STANDARD
+       </span>
+      </span>
+      <span class="loan-option-repay">
+       Repay
+       <strong>
+        1,110 gold
+       </strong>
+      </span>
+      <span class="loan-option-details">
+       <span>
+        25% fee
+       </span>
+       <span>
+        6 rounds
+       </span>
+      </span>
+     </button>
+     <button class="loan-option" data-loan="1500" type="button">
+      <span class="loan-option-top">
+       <strong>
+        1,500
+        <small>
+         GOLD
+        </small>
+       </strong>
+       <span class="loan-tier">
+        HIGHER RISK
+       </span>
+      </span>
+      <span class="loan-option-repay">
+       Repay
+       <strong>
+        2,025 gold
+       </strong>
+      </span>
+      <span class="loan-option-details">
+       <span>
+        35% fee
+       </span>
+       <span>
+        4 rounds
+       </span>
+      </span>
+     </button>
+    </div>
+    <p class="loan-warning" id="loan-warning">
+     Larger loans have higher fees and shorter repayment deadlines.
+    </p>
+   </section>
+  </div>
+  <div aria-labelledby="gameover-title" aria-modal="true" class="modal-backdrop hidden" id="gameover-modal" role="dialog">
+   <section class="modal-card gameover-card">
+    <p class="modal-kicker" id="gameover-eyebrow">
+     GAME OVER
+    </p>
+    <h2 id="gameover-title">
+     Game over
+    </h2>
+    <p class="modal-copy" id="gameover-copy">
+     This game has ended.
+    </p>
+    <div class="final-balance">
+     <span>
+      FINAL BALANCE
+     </span>
+     <strong id="final-balance">
+      0 GOLD
+     </strong>
+    </div>
+    <button class="button-primary full-button" id="new-game-button" type="button">
+     Start new game
+    </button>
+   </section>
+  </div>
+ </body>
+</html>

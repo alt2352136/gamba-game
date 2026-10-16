@@ -1,0 +1,17 @@
+name = "gamba-crash-backend"
+main = "src/index.js"
+compatibility_date = "2026-10-12"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "GAME_SESSIONS"
+class_name = "GameSession"
+
+[exports.GameSession]
+type = "durable-object"
+storage = "sqlite"
+
+[vars]
+# Set this to the exact GitHub Pages origin, e.g. https://YOURNAME.github.io
+ALLOWED_ORIGINS = "http://localhost:5500,https://elajeff.github.io"
+HOUSE_EDGE_PERCENT = "1"

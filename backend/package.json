@@ -1,0 +1,16 @@
+{
+  "name": "gamba-crash-backend",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev --port 8788",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.0"
+  }
+}
