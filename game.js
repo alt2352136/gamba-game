@@ -100,12 +100,17 @@
     resetPending: false,
     endPending: false,
     releaseRequestedWhileStarting: false,
+    startRequestKey: null,
+    releaseIntentPromise: null,
+    releaseIntentResult: null,
+    releaseCashoutKey: null,
     holdSource: null,
     activePointerId: null,
     keyboardCode: null,
     animationFrameId: null,
     pollTimerId: null,
     pollPending: false,
+    pollAbortController: null,
     statusFailureCount: 0,
     lastSettledRoundId: null,
     gameOver: false,
@@ -216,13 +221,17 @@
       let response;
       let text;
       const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const externalSignal = options.signal || null;
+      const relayExternalAbort = () => controller?.abort(externalSignal?.reason);
+      if (externalSignal?.aborted) relayExternalAbort();
+      else externalSignal?.addEventListener("abort", relayExternalAbort, { once: true });
       const timeoutId = controller
         ? setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
         : null;
       try {
         response = await fetch(`${API_BASE}${path}`, {
           ...requestOptions,
-          ...(controller ? { signal: controller.signal } : {})
+          ...(controller ? { signal: controller.signal } : externalSignal ? { signal: externalSignal } : {})
         });
         // Keep the timeout active while reading the body too, not just until headers arrive.
         text = await response.text();
@@ -235,6 +244,7 @@
         throw new Error("Couldn't reach the game server. Check your connection and try again.");
       } finally {
         if (timeoutId !== null) clearTimeout(timeoutId);
+        externalSignal?.removeEventListener("abort", relayExternalAbort);
       }
 
       let data = null;
@@ -516,6 +526,13 @@
     game.pollTimerId = null;
   }
 
+  function cancelStatusPollingForCashout() {
+    stopStatusPolling();
+    // Don't let a background status GET compete with the user's release request.
+    // It is read-only; aborting it cannot cancel or change the server-side round.
+    if (game.pollAbortController) game.pollAbortController.abort();
+  }
+
   function scheduleAnimation() {
     if (game.active && game.activeRound && !game.cashoutPending && game.animationFrameId === null) {
       game.animationFrameId = requestAnimationFrame(updateRoundFrame);
@@ -549,8 +566,12 @@
     if (!game.active || !game.activeRound || game.pollPending || game.cashoutPending) return;
     game.pollPending = true;
     const roundId = game.activeRound.id;
+    const pollController = typeof AbortController === "function" ? new AbortController() : null;
+    game.pollAbortController = pollController;
     try {
-      const result = await api(`/api/round/status?id=${encodeURIComponent(roundId)}`);
+      const result = await api(`/api/round/status?id=${encodeURIComponent(roundId)}`, {
+        ...(pollController ? { signal: pollController.signal } : {})
+      });
       game.statusFailureCount = 0;
       if (result.status === "running") {
         // Estimate server clock offset for a smoother display; only server responses settle a round.
@@ -560,10 +581,13 @@
       }
       await finishFromServerResult(result, roundId);
     } catch (error) {
+      // Cash-out deliberately aborts a redundant status request. Don't surface that as a network failure.
+      if (game.cashoutPending || pollController?.signal.aborted) return;
       game.statusFailureCount = Math.min(game.statusFailureCount + 1, 5);
       const retrySeconds = Math.min(30, (STATUS_POLL_MS * (2 ** game.statusFailureCount)) / 1000);
       setMessage(`Connection interrupted. Your round remains server-controlled. Retrying status in about ${retrySeconds}s. ${error.message}`, "danger");
     } finally {
+      if (game.pollAbortController === pollController) game.pollAbortController = null;
       game.pollPending = false;
     }
   }
@@ -701,6 +725,36 @@
     return snapshot.state;
   }
 
+  function sendEarlyReleaseIntent() {
+    if (!game.releaseRequestedWhileStarting || !game.startRequestKey || !game.clientSeed || game.releaseIntentPromise) return;
+    const releaseKey = newIdempotencyKey();
+    const startKey = game.startRequestKey;
+    // The server uses this same cash-out key if the parallel release intent finds a running round.
+    // Reusing it lets a fallback cash-out replay the original result without a conflict/status round trip.
+    game.releaseCashoutKey = `early_${releaseKey}`;
+    // Run in parallel with round startup. The Durable Object either queues the release
+    // atomically with start, or cashes out an already-committed round directly.
+    game.releaseIntentPromise = api("/api/round/release-intent", {
+      method: "POST",
+      body: { startKey },
+      idempotencyKey: releaseKey
+    }).then((result) => {
+      if (game.startRequestKey === startKey) game.releaseIntentResult = result;
+      return result;
+    }).catch((error) => {
+      const result = { releaseMode: "failed", error };
+      if (game.startRequestKey === startKey) game.releaseIntentResult = result;
+      return result;
+    });
+  }
+
+  function clearPendingStartTracking() {
+    game.startRequestKey = null;
+    game.releaseIntentPromise = null;
+    game.releaseIntentResult = null;
+    game.releaseCashoutKey = null;
+  }
+
   async function startRound(source, identifier = null) {
     if (!game.ready || game.active || game.startPending || game.gameOver || game.waitingForLoan || game.balance <= 0) return;
     const stake = getBet();
@@ -724,15 +778,46 @@
     updateUI();
 
     const idempotencyKey = newIdempotencyKey();
+    const roundNumberBeforeStart = game.roundNumber;
+    let startRequestWasSent = false;
+    game.startRequestKey = idempotencyKey;
+    game.releaseIntentPromise = null;
+    game.releaseIntentResult = null;
+    game.releaseCashoutKey = null;
     try {
       // A previous reset may have succeeded even if registering its client seed timed out.
       // Repair that state before attempting to create a round.
       await ensureClientSeed();
-      const response = await api("/api/round/start", { method: "POST", body: { stake }, idempotencyKey });
+      // If released during seed repair, queue the intent before start is submitted.
+      sendEarlyReleaseIntent();
+      const startRequest = api("/api/round/start", { method: "POST", body: { stake }, idempotencyKey });
+      startRequestWasSent = true;
+      const response = await startRequest;
+      const released = game.releaseRequestedWhileStarting;
       game.startPending = false;
+
+      // The start response itself is authoritative if the queued release was consumed in the
+      // start transaction. Do not wait for a slower parallel release-intent response unnecessarily.
+      if (response.result && response.roundId && response.state) {
+        game.releaseRequestedWhileStarting = false;
+        clearPendingStartTracking();
+        await finishFromServerResult(response, response.roundId);
+        return;
+      }
+
+      // Use an already-arrived result, but never block the start response on the parallel
+      // intent request. If it is still in flight, the regular cash-out request below races it
+      // safely through the Durable Object's serialized settlement checks.
+      const releaseResult = released ? game.releaseIntentResult : null;
+      if (releaseResult?.releaseMode === "settled" && releaseResult.roundId && releaseResult.state) {
+        game.releaseRequestedWhileStarting = false;
+        clearPendingStartTracking();
+        await finishFromServerResult(releaseResult, releaseResult.roundId);
+        return;
+      }
       game.activeBet = response.round.stake;
       game.balance = response.state.balance;
-      game.activeRound = { ...response.round, cashoutKey: null };
+      game.activeRound = { ...response.round, cashoutKey: released ? game.releaseCashoutKey : null };
       game.roundStartedAt = Number(response.round.startedAt);
       game.active = true;
       game.recoveredRound = false;
@@ -750,33 +835,62 @@
       updateUI();
       scheduleAnimation();
       scheduleStatusPoll();
-      const released = game.releaseRequestedWhileStarting;
       game.releaseRequestedWhileStarting = false;
+      clearPendingStartTracking();
       if (released) await cashOut();
     } catch (error) {
-      game.startPending = false;
       const wasReleased = game.releaseRequestedWhileStarting;
+      const releaseResult = game.releaseIntentResult;
+      const releaseCashoutKey = game.releaseCashoutKey;
+      game.startPending = false;
       game.releaseRequestedWhileStarting = false;
+      clearPendingStartTracking();
       clearHoldState();
+      if (wasReleased && releaseResult?.releaseMode === "settled" && releaseResult.roundId && releaseResult.state) {
+        await finishFromServerResult(releaseResult, releaseResult.roundId);
+        return;
+      }
+
+      // A transport/5xx failure can happen after the start transaction committed. Replay the
+      // same idempotency key only for uncertain failures; never create a second independent round.
+      let replayedStart = null;
+      if (startRequestWasSent && (!(error instanceof ApiError) || error.status >= 500)) {
+        try {
+          replayedStart = await api("/api/round/start", { method: "POST", body: { stake }, idempotencyKey });
+        } catch { /* reconcile against state below */ }
+      }
+      if (replayedStart?.result && replayedStart.roundId && replayedStart.state) {
+        await finishFromServerResult(replayedStart, replayedStart.roundId);
+        return;
+      }
+      if (replayedStart?.round?.id) {
+        activateExistingRound(replayedStart.round, false);
+        if (wasReleased) {
+          if (game.activeRound) game.activeRound.cashoutKey = releaseCashoutKey || null;
+          await cashOut();
+        } else {
+          game.holdSource = source;
+          game.activePointerId = source === "pointer" ? identifier : null;
+          game.keyboardCode = source === "keyboard" ? identifier : null;
+          updateUI();
+        }
+        return;
+      }
+
       try {
         const restored = await refreshState();
         if (restored.activeRound) {
-          // The start POST may have committed even if its response was lost. Reattach the original
-          // hold only when it was never released; otherwise this is the user's original cash-out.
-          if (wasReleased) {
-            game.recoveredRound = false;
-            await cashOut();
-          } else {
-            game.recoveredRound = false;
-            game.holdSource = source;
-            game.activePointerId = source === "pointer" ? identifier : null;
-            game.keyboardCode = source === "keyboard" ? identifier : null;
-            elements.holdButton.disabled = false;
-            elements.holdButton.classList.add("is-holding");
-            elements.holdButton.setAttribute("aria-pressed", "true");
-            elements.holdButtonTitle.textContent = "RELEASE TO CASH OUT";
-            updateUI();
-          }
+          // State alone cannot identify which tab created the round. Without a matching start-key
+          // replay, treat it as recovered and disable retrospective cash-out rather than touching
+          // another tab's active round.
+          activateExistingRound(restored.activeRound, true);
+          setMessage("An active round exists for this session, but this tab could not verify that it started the round. The server will settle it automatically.", "danger");
+          return;
+        }
+        if (wasReleased && Number(restored.roundNumber) > Number(roundNumberBeforeStart)) {
+          // The round may have settled even though both start and release responses were lost.
+          // refreshState contains the authoritative history and wallet; show that result.
+          showRecoveredLastResult(restored);
           return;
         }
       } catch { /* preserve the original request error below */ }
@@ -852,7 +966,7 @@
   function showCashoutPending() {
     // Give immediate feedback on release, while keeping the payout itself server-confirmed.
     stopAnimation();
-    stopStatusPolling();
+    cancelStatusPollingForCashout();
     elements.holdButtonTitle.textContent = "CASHING OUT…";
     elements.holdButton.classList.remove("is-holding");
     elements.holdButton.setAttribute("aria-pressed", "false");
@@ -864,6 +978,7 @@
     if (game.startPending) {
       game.releaseRequestedWhileStarting = true;
       showCashoutPending();
+      sendEarlyReleaseIntent();
       return;
     }
     if (!game.active || !game.activeRound || game.cashoutPending || game.recoveredRound) return;
@@ -903,6 +1018,7 @@
       if (source === "keyboard" && game.keyboardCode !== identifier) return;
       game.releaseRequestedWhileStarting = true;
       showCashoutPending();
+      sendEarlyReleaseIntent();
       return;
     }
     if (!game.active || game.holdSource !== source) return;
@@ -915,6 +1031,7 @@
     if (game.startPending) {
       game.releaseRequestedWhileStarting = true;
       showCashoutPending();
+      sendEarlyReleaseIntent();
       return;
     }
     if (game.active) void cashOut();

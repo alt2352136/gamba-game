@@ -171,6 +171,12 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       const noAuth = await api(baseUrl, "/api/state");
       assert.equal(noAuth.status, 401);
       assert.equal(noAuth.data.error, "unauthorized");
+
+      const noAuthReleaseIntent = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", body: { startKey: idempotencyKey() }
+      });
+      assert.equal(noAuthReleaseIntent.status, 401);
+      assert.equal(noAuthReleaseIntent.data.error, "unauthorized");
     });
 
     const created = await api(baseUrl, "/api/session", { method: "POST", body: {} });
@@ -212,6 +218,18 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       const invalidSeed = await api(baseUrl, "/api/client-seed", { method: "POST", token: auth, body: { clientSeed: "has spaces" } });
       assert.equal(invalidSeed.status, 400);
       assert.equal(invalidSeed.data.error, "invalid_client_seed");
+
+      const invalidReleaseKey = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", token: auth, headers: { "idempotency-key": "bad" }, body: { startKey: idempotencyKey() }
+      });
+      assert.equal(invalidReleaseKey.status, 400);
+      assert.equal(invalidReleaseKey.data.error, "idempotency_key_required");
+
+      const invalidStartKey = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", token: auth, headers: { "idempotency-key": idempotencyKey() }, body: { startKey: "bad" }
+      });
+      assert.equal(invalidStartKey.status, 400);
+      assert.equal(invalidStartKey.data.error, "start_key_required");
 
       const malformed = await api(baseUrl, "/api/session", { method: "POST", rawBody: "{not-json" });
       assert.equal(malformed.status, 400);
@@ -501,6 +519,109 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
         "Lifetime session statistics must survive a new game epoch.");
       assert.deepEqual(resetProfile.data.profile.leaderboard, entries,
         "Personal bests should persist across game resets.");
+    });
+
+    await t.test("early release queued before round commit settles atomically at the x1 boundary", async () => {
+      const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
+      assert.equal(fresh.status, 201, fresh.text);
+      const token = fresh.data.token;
+      const seed = await api(baseUrl, "/api/client-seed", {
+        method: "POST", token, body: { clientSeed: randomBytes(16).toString("hex") }
+      });
+      assert.equal(seed.status, 200, seed.text);
+
+      const startKey = idempotencyKey();
+      const releaseKey = idempotencyKey();
+      const queued = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", token, headers: { "idempotency-key": releaseKey }, body: { startKey }
+      });
+      assert.equal(queued.status, 200, queued.text);
+      assert.equal(queued.data.releaseMode, "queued");
+
+      const started = await api(baseUrl, "/api/round/start", {
+        method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
+      });
+      assert.equal(started.status, 200, started.text);
+      assert.ok(["cashed_out", "busted"].includes(started.data.result),
+        `An early release must be settled in the start response: ${JSON.stringify(started.data)}`);
+      assert.equal(started.data.roundId, started.data.round.id);
+      assert.equal(started.data.state.roundNumber, 1);
+      assert.equal(started.data.state.activeRound, null);
+      assert.equal(started.data.payout, started.data.result === "cashed_out" ? 1 : 0);
+
+      const replay = await api(baseUrl, "/api/round/start", {
+        method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
+      });
+      assert.equal(replay.status, 200, replay.text);
+      assert.equal(replay.data.result, started.data.result);
+      assert.equal(replay.data.state.balance, started.data.state.balance,
+        "Replaying start must not settle or credit the round a second time.");
+      const state = await api(baseUrl, "/api/state", { token });
+      assert.equal(state.data.profile.stats.roundsPlayed, 1);
+    });
+
+    await t.test("release intent after round commit settles once and is idempotent", async () => {
+      const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
+      assert.equal(fresh.status, 201, fresh.text);
+      const token = fresh.data.token;
+      const seed = await api(baseUrl, "/api/client-seed", {
+        method: "POST", token, body: { clientSeed: randomBytes(16).toString("hex") }
+      });
+      assert.equal(seed.status, 200, seed.text);
+
+      const startKey = idempotencyKey();
+      const started = await api(baseUrl, "/api/round/start", {
+        method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
+      });
+      assert.equal(started.status, 200, started.text);
+      const releaseKey = idempotencyKey();
+      const release = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", token, headers: { "idempotency-key": releaseKey }, body: { startKey }
+      });
+      assert.equal(release.status, 200, release.text);
+      assert.equal(release.data.releaseMode, "settled");
+      assert.ok(["cashed_out", "busted"].includes(release.data.result || release.data.status));
+      assert.equal(release.data.state.activeRound, null);
+      assert.equal(release.data.state.roundNumber, 1);
+
+      const replay = await api(baseUrl, "/api/round/release-intent", {
+        method: "POST", token, headers: { "idempotency-key": releaseKey }, body: { startKey }
+      });
+      assert.equal(replay.status, 200, replay.text);
+      assert.equal(replay.data.result, release.data.result);
+      assert.equal(replay.data.state.balance, release.data.state.balance);
+      const state = await api(baseUrl, "/api/state", { token });
+      assert.equal(state.data.profile.stats.roundsPlayed, 1,
+        "Duplicate early release requests must not double-settle the round.");
+    });
+
+    await t.test("public state returns only the ten history rows shown by the UI while fairness records remain available", async () => {
+      const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
+      assert.equal(fresh.status, 201, fresh.text);
+      const token = fresh.data.token;
+      const seed = await api(baseUrl, "/api/client-seed", {
+        method: "POST", token, body: { clientSeed: randomBytes(16).toString("hex") }
+      });
+      assert.equal(seed.status, 200, seed.text);
+
+      for (let index = 0; index < 12; index += 1) {
+        const started = await api(baseUrl, "/api/round/start", {
+          method: "POST", token, headers: { "idempotency-key": idempotencyKey() }, body: { stake: 1 }
+        });
+        assert.equal(started.status, 200, started.text);
+        if (started.data.result) continue; // The early x1 boundary can legitimately bust.
+        const result = await api(baseUrl, "/api/round/cashout", {
+          method: "POST", token, headers: { "idempotency-key": idempotencyKey() }, body: { roundId: started.data.round.id }
+        });
+        assert.equal(result.status, 200, result.text);
+      }
+      const state = await api(baseUrl, "/api/state", { token });
+      assert.equal(state.status, 200, state.text);
+      assert.equal(state.data.state.roundNumber, 12);
+      assert.equal(state.data.state.history.length, 10);
+      const fairness = await api(baseUrl, "/api/fairness?limit=20", { token });
+      assert.equal(fairness.status, 200, fairness.text);
+      assert.equal(fairness.data.totalRounds, 12, "Public-history trimming must not delete fairness records.");
     });
 
     await t.test("Durable Object alarm settles a round without any status poll or browser request", { timeout: 25_000 }, async () => {

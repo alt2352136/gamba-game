@@ -81,3 +81,15 @@ test("setting the same client seed again avoids a redundant state write", async 
   assert.equal(data.commitment, "a".repeat(64));
   assert.equal(writes, 0);
 });
+
+
+test("session HMAC verification key is cached by secret fingerprint and cold imports are coalesced", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
+  assert.match(source, /let cachedSessionVerifier = null/);
+  assert.match(source, /async function getSessionVerifierKey\(secret\)/);
+  assert.match(source, /const fingerprint = await sha256Hex\(secret\)/);
+  assert.match(source, /sessionVerifierKeyPromise\?\.fingerprint === fingerprint/);
+  assert.match(source, /if \(sessionVerifierKeyPromise === record\) cachedSessionVerifier = \{ fingerprint, key \}/);
+  assert.match(source, /typeof secret !== "string" \|\| secret\.length === 0\) return null/);
+});

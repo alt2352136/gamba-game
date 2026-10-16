@@ -97,3 +97,45 @@ test("an uncertain cash-out result resumes status polling if the round is still 
   const body = js.slice(start, end);
   assert.match(body, /await pollRoundStatus\(\);\s*if \(game\.active && !game\.cashoutPending\) scheduleStatusPoll\(\);/);
 });
+
+
+test("release during round startup uses a parallel, idempotent release intent", () => {
+  assert.match(js, /function sendEarlyReleaseIntent\(\)[\s\S]*?api\("\/api\/round\/release-intent"/);
+  assert.match(js, /const startKey = game\.startRequestKey;[\s\S]*?body: \{ startKey \}/);
+  assert.match(js, /if \(response\.result && response\.roundId && response\.state\)/);
+  assert.match(js, /releaseResult\?\.releaseMode === "settled"/);
+});
+
+
+test("cash-out cancels an in-flight read-only status poll", () => {
+  assert.match(js, /pollAbortController: null/);
+  assert.match(js, /function cancelStatusPollingForCashout\(\)[\s\S]*?game\.pollAbortController\.abort\(\)/);
+  assert.match(js, /pollRoundStatus\(\)[\s\S]*?signal: pollController\.signal/);
+  assert.match(js, /if \(game\.cashoutPending \|\| pollController\?\.signal\.aborted\) return/);
+  assert.match(js, /showCashoutPending\(\)[\s\S]*?cancelStatusPollingForCashout\(\)/);
+});
+
+test("window blur during startup sends the same early-release intent path", () => {
+  const start = js.indexOf("function releaseAnyHold() {");
+  const end = js.indexOf("function focusFirst", start);
+  assert.ok(start >= 0 && end > start);
+  assert.match(js.slice(start, end), /if \(game\.startPending\)[\s\S]*?sendEarlyReleaseIntent\(\)/);
+});
+
+
+test("round startup never waits on a parallel release-intent request", () => {
+  const start = js.indexOf("async function startRound(source, identifier = null)");
+  const end = js.indexOf("async function finishFromServerResult", start);
+  assert.ok(start >= 0 && end > start);
+  const body = js.slice(start, end);
+  assert.doesNotMatch(body, /await game\.releaseIntentPromise/);
+  assert.match(body, /const releaseResult = released \? game\.releaseIntentResult : null/);
+  assert.match(body, /if \(released\) await cashOut\(\)/);
+});
+
+
+test("fallback cash-out reuses the release-intent idempotency key", () => {
+  assert.match(js, /game\.releaseCashoutKey = `early_\$\{releaseKey\}`/);
+  assert.match(js, /game\.activeRound = \{ \.\.\.response\.round, cashoutKey: released \? game\.releaseCashoutKey : null \}/);
+  assert.match(js, /if \(game\.activeRound\) game\.activeRound\.cashoutKey = releaseCashoutKey \|\| null/);
+});

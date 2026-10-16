@@ -2,6 +2,7 @@ const STARTING_GOLD = 888;
 const MAX_MULTIPLIER = 10;
 const GROWTH_PER_SECOND = 0.8;
 const MAX_CLIENT_SEED_LENGTH = 128;
+const PUBLIC_HISTORY_LIMIT = 10;
 const LOANS = {
   444: { principal: 444, repayment: 533, rounds: 8 },
   888: { principal: 888, repayment: 1110, rounds: 6 },
@@ -56,19 +57,48 @@ async function hmacBytes(secretBytes, message) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
 }
 
+async function hmacBytesWithKey(key, message) {
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+}
+
 async function signedSessionToken(sessionId, secret) {
   const signature = await hmacBytes(new TextEncoder().encode(secret), sessionId);
   return `${sessionId}.${base64url(signature)}`;
 }
 
+let cachedSessionVerifier = null;
+let sessionVerifierKeyPromise = null;
+
+async function getSessionVerifierKey(secret) {
+  const fingerprint = await sha256Hex(secret);
+  if (cachedSessionVerifier?.fingerprint === fingerprint) return cachedSessionVerifier.key;
+  if (sessionVerifierKeyPromise?.fingerprint === fingerprint) return sessionVerifierKeyPromise.promise;
+
+  const record = { fingerprint, promise: null };
+  record.promise = (async () => {
+    const key = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
+    );
+    // A secret rotation between awaits must not let the older request replace a newer cache.
+    if (sessionVerifierKeyPromise === record) cachedSessionVerifier = { fingerprint, key };
+    return key;
+  })();
+  sessionVerifierKeyPromise = record;
+  try {
+    return await record.promise;
+  } finally {
+    if (sessionVerifierKeyPromise === record) sessionVerifierKeyPromise = null;
+  }
+}
+
 async function verifySessionToken(token, secret) {
-  if (typeof token !== "string") return null;
+  if (typeof token !== "string" || typeof secret !== "string" || secret.length === 0) return null;
   const dot = token.indexOf(".");
   if (dot < 1) return null;
   const sessionId = token.slice(0, dot);
   const signature = token.slice(dot + 1);
   if (!/^[0-9a-f-]{36}$/i.test(sessionId) || !/^[A-Za-z0-9_-]{40,50}$/.test(signature)) return null;
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const key = await getSessionVerifierKey(secret);
   let sigBytes;
   try {
     const padded = signature.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - signature.length % 4) % 4);
@@ -221,6 +251,9 @@ export class GameSession {
     this.ctx = ctx;
     this.env = env;
     this.sql = ctx.storage.sql;
+    // Cache only a non-extractable HMAC CryptoKey, never the decrypted server-seed string.
+    // The key is scoped to an immutable seed epoch/commitment and replaced on rotation.
+    this.cachedRoundHmacKey = null;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS seeds (
       epoch INTEGER PRIMARY KEY, commitment TEXT NOT NULL, seed_iv TEXT NOT NULL,
@@ -237,6 +270,13 @@ export class GameSession {
     catch (error) { if (!String(error?.message || error).toLowerCase().includes("duplicate column")) throw error; }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS rounds_status_idx ON rounds(status)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, action TEXT NOT NULL, response_json TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    // A release can arrive before the start request has finished its async crypto work.
+    // Persist the release intent against the start idempotency key so the start transaction
+    // can atomically create and settle the round instead of requiring two sequential requests.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS early_release_intents (
+      start_key TEXT PRIMARY KEY, release_key TEXT NOT NULL, released_at INTEGER NOT NULL, created_at INTEGER NOT NULL
+    )`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS early_release_created_idx ON early_release_intents(created_at)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS session_stats (
       id INTEGER PRIMARY KEY CHECK(id=1), rounds_played INTEGER NOT NULL DEFAULT 0,
       wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0, pushes INTEGER NOT NULL DEFAULT 0,
@@ -280,9 +320,58 @@ export class GameSession {
     return Number(round.started_at) + Math.max(0, durationMs);
   }
 
-  async clearSettlementAlarm() {
-    try { await this.ctx.storage.deleteAlarm(); }
-    catch (error) { console.error("Could not clear settled-round alarm", { errorName: error?.name || "Error" }); }
+  async clearSettlementAlarm(settledRoundId = null) {
+    try {
+      // A background cleanup for an older round must never delete a newer round's alarm.
+      const active = settledRoundId ? this.getActiveRound() : null;
+      if (active && active.id !== settledRoundId) return;
+      await this.ctx.storage.deleteAlarm();
+    } catch (error) {
+      console.error("Could not clear settled-round alarm", { errorName: error?.name || "Error" });
+    }
+  }
+
+  deferSettlementAlarmCleanup(roundId) {
+    // Alarm cleanup is housekeeping, not part of payout confirmation. Keep it off the
+    // response's critical path while ensuring it cannot cancel a later round's alarm.
+    const cleanup = this.clearSettlementAlarm(roundId);
+    if (typeof this.ctx.waitUntil === "function") this.ctx.waitUntil(cleanup);
+    else void cleanup;
+  }
+
+  async getRoundHmacKey(seedRow) {
+    const epoch = Number(seedRow.epoch);
+    const commitment = seedRow.commitment;
+    const cached = this.cachedRoundHmacKey;
+    if (cached && cached.epoch === epoch && cached.commitment === commitment) return cached.key;
+
+    // Concurrent cold starts for the same epoch share one decrypt/import operation.
+    const pending = this.roundHmacKeyPromise;
+    if (pending && pending.epoch === epoch && pending.commitment === commitment) return pending.promise;
+
+    const record = { epoch, commitment, promise: null };
+    record.promise = (async () => {
+      const seed = await decryptSeed(seedRow.seed_iv, seedRow.seed_cipher, this.env.SEED_ENCRYPTION_KEY);
+      const seedBytes = hexToBytes(seed);
+      let key;
+      try {
+        key = await crypto.subtle.importKey(
+          "raw", seedBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+        );
+      } finally {
+        seedBytes.fill(0);
+      }
+      // A reset can rotate epochs while the decrypt/import promise is in flight.
+      // Do not let an old epoch overwrite a newer epoch's cache.
+      if (this.roundHmacKeyPromise === record) this.cachedRoundHmacKey = { epoch, commitment, key };
+      return key;
+    })();
+    this.roundHmacKeyPromise = record;
+    try {
+      return await record.promise;
+    } finally {
+      if (this.roundHmacKeyPromise === record) this.roundHmacKeyPromise = null;
+    }
   }
 
   recordSettledRound(round, item) {
@@ -373,6 +462,7 @@ export class GameSession {
       if (url.pathname === "/api/state" && request.method === "GET") return this.stateResponse();
       if (url.pathname === "/api/client-seed" && request.method === "POST") return await this.setClientSeed(await readJsonLimited(request));
       if (url.pathname === "/api/round/start" && request.method === "POST") return await this.startRound(await readJsonLimited(request), request.headers.get("idempotency-key"));
+      if (url.pathname === "/api/round/release-intent" && request.method === "POST") return await this.releaseIntent(await readJsonLimited(request), request.headers.get("idempotency-key"));
       if (url.pathname === "/api/round/cashout" && request.method === "POST") return await this.cashOut(await readJsonLimited(request), request.headers.get("idempotency-key"));
       if (url.pathname === "/api/round/status" && request.method === "GET") return await this.roundStatus(url.searchParams.get("id"));
       if (url.pathname === "/api/loan" && request.method === "POST") return await this.takeLoan(await readJsonLimited(request), request.headers.get("idempotency-key"));
@@ -444,7 +534,7 @@ export class GameSession {
       activeLoans: state.activeLoans, loansTaken: state.loansTaken,
       loansRepaid: state.loansRepaid || { "444": false, "888": false, "1500": false },
       activeRound: active ? { id: active.id, stake: active.stake, startedAt: active.started_at, commitment: this.currentCommitment() } : null,
-      history: state.history.slice(-100)
+      history: state.history.slice(-PUBLIC_HISTORY_LIMIT)
     };
   }
 
@@ -476,10 +566,90 @@ export class GameSession {
     return json({ clientSeed: seed, commitment: this.currentCommitment() });
   }
 
+  async storeReleaseIntentResponse(idempotencyKey, responseData) {
+    let result = responseData;
+    this.ctx.storage.transactionSync(() => {
+      const cached = this.cachedIdempotent(idempotencyKey, "round-release-intent");
+      if (cached) result = cached;
+      else this.storeIdempotent(idempotencyKey, "round-release-intent", responseData);
+    });
+    return json(result);
+  }
+
+  async releaseIntent(body, idempotencyKey) {
+    const state = this.readState();
+    if (!state) throw new ApiError(409, "session_not_initialized", "Create a session first.");
+    // Prefixing the internal cash-out key must remain inside the common 100-character limit.
+    if (!idempotencyKey || !/^[A-Za-z0-9_-]{16,90}$/.test(idempotencyKey)) {
+      throw new ApiError(400, "idempotency_key_required", "Send a unique Idempotency-Key header (16–90 URL-safe characters).");
+    }
+    const startKey = body?.startKey;
+    if (typeof startKey !== "string" || !/^[A-Za-z0-9_-]{16,100}$/.test(startKey)) {
+      throw new ApiError(400, "start_key_required", "Provide the idempotency key used to start the round.");
+    }
+    const cached = this.cachedIdempotent(idempotencyKey, "round-release-intent");
+    if (cached) return json(cached);
+
+    const round = this.sql.exec("SELECT id,status FROM rounds WHERE idempotency_key=?", startKey).toArray()[0];
+    if (round) {
+      let resultResponse;
+      if (round.status === "running") {
+        const internalCashoutKey = `early_${idempotencyKey}`;
+        const settledResponse = await this.cashOut({ roundId: round.id }, internalCashoutKey);
+        const settledData = await settledResponse.json();
+        if (settledResponse.ok) {
+          resultResponse = settledData;
+        } else if (settledResponse.status === 409 && settledData?.error === "round_not_running") {
+          // An alarm/status request may have settled the round between our first read and cash-out.
+          const statusResponse = await this.roundStatus(round.id);
+          resultResponse = await statusResponse.json();
+        } else {
+          return json(settledData || { error: "release_not_confirmed" }, settledResponse.status);
+        }
+      } else {
+        const statusResponse = await this.roundStatus(round.id);
+        resultResponse = await statusResponse.json();
+      }
+      return this.storeReleaseIntentResponse(idempotencyKey, { ...resultResponse, releaseMode: "settled" });
+    }
+
+    if (state.gameOver || state.waitingForLoan || state.balance <= 0 || !state.clientSeed) {
+      throw new ApiError(409, "round_not_startable", "There is no eligible round start to release.");
+    }
+    const active = this.getActiveRound();
+    if (active && active.idempotency_key !== startKey) {
+      throw new ApiError(409, "round_already_running", "Another round is already running.");
+    }
+
+    const now = Date.now();
+    const queued = { releaseMode: "queued", startKey };
+    let resultResponse = queued;
+    this.ctx.storage.transactionSync(() => {
+      const alreadyCached = this.cachedIdempotent(idempotencyKey, "round-release-intent");
+      if (alreadyCached) {
+        resultResponse = alreadyCached;
+        return;
+      }
+      // Stale entries can only result from a start request that failed before creating a round.
+      this.sql.exec("DELETE FROM early_release_intents WHERE created_at < ?", now - 60_000);
+      const previousIntent = this.sql.exec("SELECT start_key FROM early_release_intents WHERE start_key=?", startKey).toArray()[0];
+      if (!previousIntent) {
+        this.sql.exec("INSERT INTO early_release_intents(start_key,release_key,released_at,created_at) VALUES(?,?,?,?)",
+          startKey, idempotencyKey, now, now);
+      }
+      this.storeIdempotent(idempotencyKey, "round-release-intent", queued);
+      resultResponse = queued;
+    });
+    return json(resultResponse);
+  }
+
   async startRound(body, idempotencyKey) {
     const state = this.readState();
     if (!state) throw new ApiError(409, "session_not_initialized", "Create a session first.");
     if (!idempotencyKey || !/^[A-Za-z0-9_-]{16,100}$/.test(idempotencyKey)) throw new ApiError(400, "idempotency_key_required", "Send a unique Idempotency-Key header (16–100 URL-safe characters).");
+    // Bound orphaned intents from starts that failed before creating a round, but preserve
+    // an intent associated with this same in-flight idempotency key.
+    this.sql.exec("DELETE FROM early_release_intents WHERE created_at < ?", Date.now() - 60_000);
     const cached = this.cachedIdempotent(idempotencyKey, "round-start");
     if (cached) return json(cached);
     const existing = this.sql.exec("SELECT response_json FROM rounds WHERE idempotency_key=?", idempotencyKey).toArray()[0];
@@ -501,13 +671,14 @@ export class GameSession {
     const clientSeed = state.clientSeed;
     const seedRow = this.sql.exec("SELECT * FROM seeds WHERE epoch=?", epoch).toArray()[0];
     if (!seedRow) throw new ApiError(500, "seed_missing", "Current fairness seed is unavailable.");
-    const seed = await decryptSeed(seedRow.seed_iv, seedRow.seed_cipher, this.env.SEED_ENCRYPTION_KEY);
+    const hmacKey = await this.getRoundHmacKey(seedRow);
     const nonce = state.roundNumber + 1;
-    const digest = await hmacBytes(hexToBytes(seed), `${clientSeed}:${nonce}`);
+    const digest = await hmacBytesWithKey(hmacKey, `${clientSeed}:${nonce}`);
     const crashPoint = crashPointFromDigest(digest, state.edgePercent);
     const roundId = crypto.randomUUID();
     const startedAt = Date.now();
-    const response = { round: { id: roundId, nonce, epoch, stake, startedAt, commitment: seedRow.commitment }, state: { balance: state.balance - stake, roundNumber: state.roundNumber } };
+    const roundPayload = { id: roundId, nonce, epoch, stake, startedAt, commitment: seedRow.commitment };
+    let response;
     const duplicateAfterCrypto = this.cachedIdempotent(idempotencyKey, "round-start");
     if (duplicateAfterCrypto) return json(duplicateAfterCrypto);
 
@@ -523,17 +694,57 @@ export class GameSession {
       this.writeState(latest);
       // Keep the replay payload in the idempotency table only; response_json remains for legacy rows.
       this.sql.exec("INSERT INTO rounds(id,nonce,epoch,client_seed,stake,started_at,crash_point,status,idempotency_key,edge_percent) VALUES(?,?,?,?,?,?,?,'running',?,?)",
-        roundId, nonce, epoch, state.clientSeed, stake, startedAt, crashPoint, idempotencyKey, state.edgePercent);
+        roundId, nonce, epoch, clientSeed, stake, startedAt, crashPoint, idempotencyKey, state.edgePercent);
+
+      const roundRecord = { id: roundId, nonce, epoch, client_seed: clientSeed, stake,
+        started_at: startedAt, crash_point: crashPoint, status: "running", edge_percent: state.edgePercent };
+      const earlyRelease = this.sql.exec(
+        "SELECT released_at FROM early_release_intents WHERE start_key=? AND created_at>=?",
+        idempotencyKey, startedAt - 60_000
+      ).toArray()[0];
+      if (earlyRelease) {
+        // The release reached the server before this round was committed. Its only fair
+        // interpretation is cash-out at the start boundary (x1.00), still subject to bust-at-x1.
+        const bustedAtStart = 1 >= crashPoint;
+        const settled = this.settleRound(
+          roundRecord, latest, bustedAtStart ? "BUSTED" : "CASHED OUT",
+          bustedAtStart ? crashPoint : 1, bustedAtStart ? 0 : stake, startedAt
+        );
+        this.sql.exec("UPDATE rounds SET status=?,payout=?,cashed_out_at=? WHERE id=? AND status='running'",
+          bustedAtStart ? "busted" : "cashed_out", bustedAtStart ? 0 : stake, startedAt, roundId);
+        this.writeState(settled.state);
+        this.recordSettledRound(roundRecord, settled.historyItem);
+        this.sql.exec("DELETE FROM early_release_intents WHERE start_key=?", idempotencyKey);
+        response = {
+          round: roundPayload,
+          result: bustedAtStart ? "busted" : "cashed_out",
+          roundId,
+          ...(bustedAtStart ? { crashPoint } : {}),
+          multiplier: bustedAtStart ? crashPoint : 1,
+          payout: bustedAtStart ? 0 : stake,
+          net: settled.historyItem.net,
+          state: this.publicState(settled.state, null),
+          historyItem: settled.historyItem,
+          repayments: settled.repayments,
+          defaultedLoan: settled.defaultedLoan,
+          profile: this.profileData()
+        };
+      } else {
+        response = { round: roundPayload, state: { balance: latest.balance, roundNumber: latest.roundNumber } };
+      }
       this.storeIdempotent(idempotencyKey, "round-start", response);
     });
-    // One Durable Object alarm settles the round if the browser disconnects. Any scheduling
-    // error is logged but never turns an already-deducted stake into an ambiguous HTTP failure.
-    try {
-      await this.ctx.storage.setAlarm(this.settlementAt({ started_at: startedAt, crash_point: crashPoint }));
-    } catch (error) {
-      console.error("Round alarm scheduling failed", { roundId, errorName: error?.name || "Error" });
+
+    if (!response.result) {
+      // One Durable Object alarm settles the round if the browser disconnects. Alarm persistence
+      // remains on the start path; it must be durable before the server confirms the round.
+      try {
+        await this.ctx.storage.setAlarm(this.settlementAt({ started_at: startedAt, crash_point: crashPoint }));
+      } catch (error) {
+        console.error("Round alarm scheduling failed", { roundId, errorName: error?.name || "Error" });
+      }
     }
-    return json({ ...response, crashPoint: undefined });
+    return json(response.result ? response : { ...response, crashPoint: undefined });
   }
 
   settleRound(round, state, result, multiplier, payout, now) {
@@ -592,7 +803,7 @@ export class GameSession {
         repayments: settled.repayments, defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       this.storeIdempotent(idempotencyKey, "cashout", response);
     });
-    await this.clearSettlementAlarm();
+    this.deferSettlementAlarmCleanup(roundId);
     return json(response);
   }
 
@@ -619,7 +830,7 @@ export class GameSession {
         defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       if (idempotencyKey) this.storeIdempotent(idempotencyKey, "cashout", response);
     });
-    await this.clearSettlementAlarm();
+    this.deferSettlementAlarmCleanup(round.id);
     return json(response);
   }
 
@@ -646,7 +857,7 @@ export class GameSession {
         defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       if (idempotencyKey) this.storeIdempotent(idempotencyKey, "cashout", response);
     });
-    await this.clearSettlementAlarm();
+    this.deferSettlementAlarmCleanup(round.id);
     return response;
   }
 
