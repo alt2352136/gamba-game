@@ -108,7 +108,6 @@
     releaseIntentPromise: null,
     releaseIntentResult: null,
     releaseCashoutKey: null,
-    cashoutTimingTrace: null,
     holdSource: null,
     activePointerId: null,
     keyboardCode: null,
@@ -210,97 +209,6 @@
     }
   }
 
-  function timingDebugEnabled() {
-    try {
-      return new URLSearchParams(window.location.search).get("debugTiming") === "1" ||
-        window.localStorage.getItem("gamba.debugTiming") === "1";
-    } catch { return false; }
-  }
-
-  function beginCashoutTiming(source) {
-    // The timing trace is entirely opt-in to keep normal gameplay work minimal.
-    if (!timingDebugEnabled()) {
-      game.cashoutTimingTrace = null;
-      return null;
-    }
-    const now = performance.now();
-    const existing = game.cashoutTimingTrace;
-    const roundId = game.activeRound?.id || null;
-    const startKey = game.startRequestKey;
-    if (existing && !existing.logged && now - existing.releaseAt < 30_000 &&
-        ((roundId && existing.roundId === roundId) || (startKey && existing.startKey === startKey))) return existing;
-    const trace = {
-      releaseAt: now,
-      releaseWallAt: Date.now(),
-      source,
-      startKey: game.startRequestKey,
-      roundId: game.activeRound?.id || null,
-      requests: [],
-      logged: false
-    };
-    game.cashoutTimingTrace = trace;
-    return trace;
-  }
-
-  function recordCashoutRequestTiming(trace, label, measurement) {
-    if (!trace || !measurement) return;
-    let request = trace.requests.find((item) => item.label === label && item.attempt === measurement.attempt);
-    if (!request) {
-      request = { label, attempt: measurement.attempt || 1 };
-      trace.requests.push(request);
-    }
-    Object.assign(request, measurement);
-    // If a WebSocket settled the round before the corresponding HTTP body arrived,
-    // preserve the late request timing as a second diagnostic line rather than dropping it.
-    if (trace.logged && timingDebugEnabled() && Number.isFinite(measurement.bodyReceivedAt)) {
-      console.info(`[gamba timing] late ${label} response`, {
-        attempt: request.attempt,
-        status: request.status,
-        requestToBodyMs: Math.round((request.bodyReceivedAt - request.requestStartedAt) * 10) / 10
-      });
-    }
-  }
-
-  function logCashoutTiming(response, resultSource, receivedAt = performance.now()) {
-    const trace = game.cashoutTimingTrace;
-    if (!trace || trace.logged) return;
-    const result = response?.result || response?.status || "unknown";
-    if (result === "running" || result === "unknown") return;
-    trace.logged = true;
-    trace.resultReceivedAt = receivedAt;
-    trace.resultSource = resultSource;
-    trace.serverTiming = response?.timing || null;
-    trace.result = result;
-    if (!timingDebugEnabled()) return;
-
-    const duration = (end, start) => Number.isFinite(end) && Number.isFinite(start)
-      ? Math.round((end - start) * 10) / 10 : null;
-    const requestRows = trace.requests.map((request) => ({
-      phase: request.label,
-      attempt: request.attempt,
-      http: request.status ?? (request.errorName || "pending"),
-      "request → body (ms)": duration(request.bodyReceivedAt, request.requestStartedAt),
-      "release → request (ms)": duration(request.requestStartedAt, trace.releaseAt)
-    }));
-    const server = trace.serverTiming || {};
-    const summary = {
-      result: trace.result,
-      resultSource: trace.resultSource,
-      releaseSource: trace.source,
-      releaseToResultMs: duration(trace.resultReceivedAt, trace.releaseAt),
-      serverProcessingMs: Number.isFinite(server.serverProcessingMs) ? server.serverProcessingMs : null,
-      serverReceiveTime: server.serverReceivedAt ?? null,
-      serverSettlementTime: server.serverSettledAt ?? null,
-      settlementSource: server.settlementSource || null
-    };
-    console.groupCollapsed(`[gamba timing] ${result} · ${summary.releaseToResultMs ?? "?"} ms release → result`);
-    console.table(summary);
-    if (requestRows.length) console.table(requestRows);
-    else console.info("No completed request timing was attached before settlement delivery.");
-    console.info("Server timing is measured on the server clock; client timings use performance.now(). No diagnostic data is uploaded separately.");
-    console.groupEnd();
-  }
-
   async function api(path, options = {}) {
     if (!API_BASE) throw new Error("Backend URL is not configured. Check backend-config.js.");
     const method = options.method || "GET";
@@ -329,25 +237,14 @@
       const timeoutId = controller
         ? setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
         : null;
-      const captureTiming = typeof options.onTiming === "function";
-      const requestStartedAt = captureTiming ? performance.now() : null;
-      let headersReceivedAt = null;
       try {
         response = await fetch(`${API_BASE}${path}`, {
           ...requestOptions,
           ...(controller ? { signal: controller.signal } : externalSignal ? { signal: externalSignal } : {})
         });
-        if (captureTiming) headersReceivedAt = performance.now();
         // Keep the timeout active while reading the body too, not just until headers arrive.
         text = await response.text();
-        if (captureTiming) {
-          const bodyReceivedAt = performance.now();
-          try { options.onTiming({ attempt: attempt + 1, requestStartedAt, headersReceivedAt, bodyReceivedAt, status: response.status }); } catch { /* diagnostics must never affect gameplay */ }
-        }
       } catch (error) {
-        if (captureTiming) {
-          try { options.onTiming({ attempt: attempt + 1, requestStartedAt, headersReceivedAt, bodyReceivedAt: performance.now(), status: response?.status ?? null, errorName: error?.name || "Error" }); } catch { /* diagnostics must never affect gameplay */ }
-        }
         lastNetworkError = error;
         if (attempt + 1 < maxAttempts) continue; // Retry only idempotent actions with the same key.
         if (error?.name === "AbortError") {
@@ -725,7 +622,7 @@
         if (!game.cashoutPending) scheduleAnimation();
         return;
       }
-      await finishFromServerResult(result, roundId, "status-poll");
+      await finishFromServerResult(result, roundId);
     } catch (error) {
       // Cash-out deliberately aborts a redundant status request. Don't surface that as a network failure.
       if (game.cashoutPending || pollController?.signal.aborted) return;
@@ -852,7 +749,7 @@
       syncServerClock(payload.serverTime);
       if (payload.type !== "round-settled" || !payload.roundId) return;
       if (game.activeRound?.id === payload.roundId) {
-        void finishFromServerResult(payload, payload.roundId, "websocket");
+        void finishFromServerResult(payload, payload.roundId);
       } else if (game.startPending && payload.startKey && payload.startKey === game.startRequestKey) {
         // A very fast crash may settle before the start HTTP response reaches this browser.
         game.pendingSettlementEvent = payload;
@@ -936,7 +833,6 @@
     // The server uses this same cash-out key if the parallel release intent finds a running round.
     // Reusing it lets a fallback cash-out replay the original result without a conflict/status round trip.
     game.releaseCashoutKey = `early_${releaseKey}`;
-    const timingTrace = game.cashoutTimingTrace;
     // Run in parallel with round startup. The Durable Object either queues the release
     // atomically with start, or cashes out an already-committed round directly.
     game.releaseIntentPromise = api("/api/round/release-intent", {
@@ -944,8 +840,7 @@
       // While startup is pending, the interface remains at x1.00. Keep that visible
       // boundary as the release cap if the round was created before this intent arrives.
       body: { startKey, requestedMultiplierCents: 100 },
-      idempotencyKey: releaseKey,
-      ...(timingTrace ? { onTiming: (measurement) => recordCashoutRequestTiming(timingTrace, "release-intent", measurement) } : {})
+      idempotencyKey: releaseKey
     }).then((result) => {
       if (game.startRequestKey === startKey) game.releaseIntentResult = result;
       return result;
@@ -1003,13 +898,8 @@
       await ensureClientSeed();
       // If released during seed repair, queue the intent before start is submitted.
       sendEarlyReleaseIntent();
-      const captureStartTiming = timingDebugEnabled();
       const startRequest = api("/api/round/start", {
-        method: "POST", body: { stake }, idempotencyKey,
-        ...(captureStartTiming ? { onTiming: (measurement) => {
-          const trace = game.cashoutTimingTrace;
-          if (trace?.startKey === idempotencyKey) recordCashoutRequestTiming(trace, "round-start", measurement);
-        } } : {})
+        method: "POST", body: { stake }, idempotencyKey
       });
       startRequestWasSent = true;
       const response = await startRequest;
@@ -1022,7 +912,7 @@
       if (response.result && response.roundId && response.state) {
         game.releaseRequestedWhileStarting = false;
         clearPendingStartTracking();
-        await finishFromServerResult(response, response.roundId, "start-http");
+        await finishFromServerResult(response, response.roundId);
         return;
       }
       const pendingSettlement = game.pendingSettlementEvent;
@@ -1030,7 +920,7 @@
         game.pendingSettlementEvent = null;
         game.releaseRequestedWhileStarting = false;
         clearPendingStartTracking();
-        await finishFromServerResult(pendingSettlement, pendingSettlement.roundId, "websocket-buffered");
+        await finishFromServerResult(pendingSettlement, pendingSettlement.roundId);
         return;
       }
 
@@ -1041,14 +931,14 @@
       if (releaseResult?.releaseMode === "settled" && releaseResult.roundId && releaseResult.state) {
         game.releaseRequestedWhileStarting = false;
         clearPendingStartTracking();
-        await finishFromServerResult(releaseResult, releaseResult.roundId, "release-intent-http");
+        await finishFromServerResult(releaseResult, releaseResult.roundId);
         return;
       }
       game.activeBet = response.round.stake;
       game.balance = response.state.balance;
       game.activeRound = { ...response.round, cashoutKey: released ? game.releaseCashoutKey : null };
       game.roundStartedAt = Number(response.round.startedAt);
-      game.active = true;
+        game.active = true;
       game.recoveredRound = false;
       game.multiplier = 1;
       game.lastSettledRoundId = null;
@@ -1076,7 +966,7 @@
       clearPendingStartTracking();
       clearHoldState();
       if (wasReleased && releaseResult?.releaseMode === "settled" && releaseResult.roundId && releaseResult.state) {
-        await finishFromServerResult(releaseResult, releaseResult.roundId, "release-intent-http");
+        await finishFromServerResult(releaseResult, releaseResult.roundId);
         return;
       }
 
@@ -1089,7 +979,7 @@
         } catch { /* reconcile against state below */ }
       }
       if (replayedStart?.result && replayedStart.roundId && replayedStart.state) {
-        await finishFromServerResult(replayedStart, replayedStart.roundId, "start-replay");
+        await finishFromServerResult(replayedStart, replayedStart.roundId);
         return;
       }
       if (replayedStart?.round?.id) {
@@ -1130,15 +1020,10 @@
     }
   }
 
-  async function finishFromServerResult(response, roundId, resultSource = "http") {
+  async function finishFromServerResult(response, roundId) {
     if (!roundId || game.lastSettledRoundId === roundId || game.settlingRoundId === roundId) return;
     let result = response.result || response.status;
     if (result === "running") return;
-    const receivedAt = performance.now();
-    if (game.cashoutTimingTrace && (!game.cashoutTimingTrace.roundId || game.cashoutTimingTrace.roundId === roundId)) {
-      game.cashoutTimingTrace.roundId = roundId;
-      logCashoutTiming(response, resultSource, receivedAt);
-    }
     game.settlingRoundId = roundId;
     try {
       if (!response.state) {
@@ -1225,9 +1110,7 @@
       return;
     }
     if (!game.active || !game.activeRound || game.cashoutPending || game.recoveredRound) return;
-    beginCashoutTiming(game.holdSource || "programmatic");
     const requestedMultiplierCents = getVisibleMultiplierCents();
-    const timingTrace = game.cashoutTimingTrace;
     game.cashoutPending = true;
     showCashoutPending();
     if (!game.activeRound.cashoutKey) game.activeRound.cashoutKey = newIdempotencyKey();
@@ -1236,10 +1119,9 @@
       const response = await api("/api/round/cashout", {
         method: "POST",
         body: { roundId, requestedMultiplierCents },
-        idempotencyKey: game.activeRound.cashoutKey,
-        ...(timingTrace ? { onTiming: (measurement) => recordCashoutRequestTiming(timingTrace, "cashout", measurement) } : {})
+        idempotencyKey: game.activeRound.cashoutKey
       });
-      await finishFromServerResult(response, roundId, "cashout-http");
+      await finishFromServerResult(response, roundId);
     } catch (error) {
       // The WebSocket can confirm settlement before a slower HTTP cash-out times out.
       // Do not overwrite that result or reopen recovery UI after the round is already done.
@@ -1249,7 +1131,7 @@
         try {
           const status = await api(`/api/round/status?id=${encodeURIComponent(roundId)}`);
           if (status.status !== "running") {
-            await finishFromServerResult(status, roundId, "status-after-cashout");
+            await finishFromServerResult(status, roundId);
             return;
           }
         } catch { /* show the original message below */ }
@@ -1266,7 +1148,6 @@
     if (game.startPending && game.holdSource === source) {
       if (source === "pointer" && game.activePointerId !== identifier) return;
       if (source === "keyboard" && game.keyboardCode !== identifier) return;
-      beginCashoutTiming(source);
       game.releaseRequestedWhileStarting = true;
       showCashoutPending();
       sendEarlyReleaseIntent();
@@ -1275,20 +1156,17 @@
     if (!game.active || game.holdSource !== source) return;
     if (source === "pointer" && game.activePointerId !== identifier) return;
     if (source === "keyboard" && game.keyboardCode !== identifier) return;
-    beginCashoutTiming(source);
     void cashOut();
   }
 
   function releaseAnyHold() {
     if (game.startPending && game.holdSource) {
-      beginCashoutTiming("window-release");
       game.releaseRequestedWhileStarting = true;
       showCashoutPending();
       sendEarlyReleaseIntent();
       return;
     }
     if (game.active && game.holdSource) {
-      beginCashoutTiming("window-release");
       void cashOut();
     }
   }

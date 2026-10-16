@@ -64,7 +64,7 @@ test("loan exhaustion checks all defined tiers and tolerates partial server flag
 });
 
 test("round settlement chooses one modal path per server response", () => {
-  const match = js.match(/async function finishFromServerResult\(response, roundId, resultSource = "http"\)\s*\{([\s\S]*?)\n  \}\n\n  function showCashoutPending/);
+  const match = js.match(/async function finishFromServerResult\(response, roundId\)\s*\{([\s\S]*?)\n  \}\n\n  function showCashoutPending/);
   assert.ok(match, "Settlement handler should remain easy to audit");
   assert.match(match[1], /applyState\(response\.state, response\.profile, \{ updateModals: false \}\)/);
   assert.match(match[1], /if \(response\.defaultedLoan \|\| response\.state\.gameOver\)[\s\S]*?else if \(response\.state\.waitingForLoan && response\.state\.balance <= 0\)[\s\S]*?else \{/);
@@ -150,7 +150,7 @@ test("client opens an authenticated WebSocket for prompt server settlement event
 
 test("server-push settlement is guarded against races with HTTP responses and polling", () => {
   assert.match(js, /game\.settlingRoundId === roundId/);
-  assert.match(js, /finishFromServerResult\(payload, payload\.roundId, "websocket"\)/);
+  assert.match(js, /finishFromServerResult\(payload, payload\.roundId\)/);
   assert.match(js, /if \(game\.activeRound\?\.id === payload\.roundId\)/);
 });
 
@@ -192,13 +192,18 @@ test("hold control suppresses iOS text selection and touch callouts without remo
   assert.match(js, /event\.code !== "Space" && event\.code !== "Enter"/);
 });
 
-test("cash-out timing diagnostics are opt-in, local-only, and report client and server phases", () => {
-  assert.match(js, /gamba\.debugTiming/);
-  assert.match(js, /if \(!timingDebugEnabled\(\)\) \{\s*game\.cashoutTimingTrace = null;/);
-  assert.match(js, /releaseAt:\s*now/);
-  assert.match(js, /requestStartedAt, headersReceivedAt, bodyReceivedAt, status/);
-  assert.match(js, /releaseToResultMs/);
-  assert.match(js, /serverProcessingMs/);
-  assert.match(js, /No diagnostic data is uploaded separately/);
-  assert.match(js, /onTiming:\s*\(measurement\) => recordCashoutRequestTiming/);
+test("temporary timing diagnostics are absent from the production client", () => {
+  for (const marker of [
+    "gamba.debugTiming",
+    "timingDebugEnabled",
+    "beginCashoutTiming",
+    "recordCashoutRequestTiming",
+    "logCashoutTiming",
+    "logRoundOutcomeTiming",
+    "[gamba timing]",
+    "serverProcessingMs"
+  ]) {
+    assert.doesNotMatch(js, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      `Production client should not contain temporary diagnostic marker: ${marker}`);
+  }
 });

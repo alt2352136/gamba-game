@@ -4,7 +4,7 @@ A browser-based crash game built with vanilla JavaScript and Cloudflare Workers.
 
 ## Technical highlights
 
-- **Transactional gameplay:** Per-session Durable Objects serialize mutations; SQLite-backed state changes, idempotency keys, and concurrency checks prevent duplicate stakes or payouts when requests are retried or race. Durable Object alarms settle rounds even if the browser disconnects.
+- **Transactional gameplay:** Per-session Durable Objects serialize mutations. A durable start reservation plus edge-received timestamps prevent overlapping start requests from opening a second round—even if the first crashes instantly at `1.00×`. SQLite transactions and idempotency keys protect wallet mutations; Durable Object alarms settle rounds if the browser disconnects.
 - **Verifiable outcomes:** Each server seed is committed by SHA-256 before use. HMAC-SHA-256 and the first 52 digest bits determine the crash point; unrevealed seeds are encrypted with AES-256-GCM and revealed at rotation. Verification can reproduce recorded outcomes, but cannot prove that no round was omitted or that deployed code never changed.
 - **Low-latency round handling:** An authenticated WebSocket pushes settlement events. An idempotent release-intent endpoint handles a release that arrives while round startup is still in flight, avoiding an unnecessary sequential request. Adaptive status polling provides recovery when push is unavailable; settlement remains server-controlled.
 - **Security controls:** Signed session tokens, exact-origin CORS, bounded request bodies, and Cloudflare-managed secrets protect the API boundary. Non-extractable `CryptoKey` objects are cached for warm requests without caching a plaintext server seed as a long-lived field.
@@ -30,10 +30,6 @@ crashMultiplier = crashCents / 100
 The browser estimates the multiplier from a server timestamp using `performance.now()`, so changes to the local system clock do not drive the display. On release, the client sends the cent-rounded multiplier it actually displayed as a **maximum requested payout multiplier**. The server still checks the committed crash point against its own clock first, and caps a successful cash-out at the lower of that request and the server's live multiplier; a request that arrives after the crash still loses. If a release reaches the server at the x10 boundary before the automatic alarm settles the round, the same visible-value cap applies. If the automatic x10 settlement commits first, its result stands. This avoids upward jumps in successful cash-out results without trusting the client to declare that a round survived. Network delivery and platform scheduling can still delay crash notifications, and the display remains an estimate. The crash point is not sent while a round is running.
 
 The server publishes a SHA-256 commitment before using a seed and reveals the seed at rotation. This lets anyone recompute recorded results against the commitment and formula, but it does not prove the completeness of the public history or the immutability of deployed code.
-
-### Timing diagnostics
-
-To inspect a round locally, open DevTools, run `localStorage.setItem("gamba.debugTiming", "1")`, and reload the page. The Console reports release-to-result time, request-to-response duration, server receive-to-settlement time, and whether the result arrived over HTTP or WebSocket. Disable it with `localStorage.removeItem("gamba.debugTiming")` and reload. Diagnostics stay in the browser console; the game does not upload separate telemetry. Client monotonic times and server wall-clock timestamps are different clocks, so do not subtract them to infer one-way network latency.
 
 ## Run locally
 
