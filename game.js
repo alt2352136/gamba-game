@@ -81,8 +81,6 @@
     balance: STARTING_GOLD,
     activeBet: 0,
     multiplier: 1,
-    visualWobblePixels: 0,
-    wobbleSeed: 0,
     roundStartedAt: 0,
     serverClockOffset: 0,
     activeRound: null,
@@ -422,7 +420,15 @@
     const progress = ((game.multiplier - 1) / (MAX_MULTIPLIER - 1)) * 100;
     const clamped = Math.max(0, Math.min(100, progress));
     elements.meterFill.style.width = `${clamped}%`;
-    elements.meterWobble.style.left = `calc(${clamped}% + ${game.active ? game.visualWobblePixels.toFixed(2) : 0}px)`;
+    // Keep the endpoint marker locked to the actual fill edge. A cosmetic wobble
+    // makes the progress line appear to detach from its marker.
+    const trackWidth = elements.meterTrack.clientWidth;
+    const markerRadius = 3.5;
+    const endpoint = trackWidth * clamped / 100;
+    const markerX = trackWidth > markerRadius * 2
+      ? Math.max(markerRadius, Math.min(trackWidth - markerRadius, endpoint))
+      : endpoint;
+    elements.meterWobble.style.left = `${markerX}px`;
     elements.meterTrack.classList.toggle("is-running", game.active);
     elements.meterTrack.classList.toggle("busted", elements.multiplier.classList.contains("busted"));
   }
@@ -495,15 +501,16 @@
   }
 
   function scheduleAnimation() {
-    if (game.active && game.animationFrameId === null) game.animationFrameId = requestAnimationFrame(updateRoundFrame);
+    if (game.active && game.activeRound && !game.cashoutPending && game.animationFrameId === null) {
+      game.animationFrameId = requestAnimationFrame(updateRoundFrame);
+    }
   }
 
   function updateRoundFrame() {
     game.animationFrameId = null;
-    if (!game.active || !game.activeRound) return;
+    if (!game.active || !game.activeRound || game.cashoutPending) return;
     const elapsed = Math.max(0, (Date.now() + game.serverClockOffset - Number(game.activeRound.startedAt)) / 1000);
     game.multiplier = Math.min(MAX_MULTIPLIER, 1 + elapsed * GROWTH_PER_SECOND);
-    game.visualWobblePixels = Math.sin(elapsed * 6.1) * 3.2 + Math.sin(elapsed * 13.7 + game.wobbleSeed) * 1.6;
     // This animation is cosmetic. Only the server decides if a cash-out beats the crash.
     updateMultiplierDisplay();
     scheduleAnimation();
@@ -511,7 +518,7 @@
 
   function scheduleStatusPoll() {
     stopStatusPolling();
-    if (!game.active || !game.activeRound || document.hidden) return;
+    if (!game.active || !game.activeRound || document.hidden || game.cashoutPending) return;
     const retryDelay = game.statusFailureCount > 0
       ? Math.min(30_000, STATUS_POLL_MS * (2 ** Math.min(game.statusFailureCount, 5)))
       : STATUS_POLL_MS;
@@ -523,7 +530,7 @@
   }
 
   async function pollRoundStatus() {
-    if (!game.active || !game.activeRound || game.pollPending) return;
+    if (!game.active || !game.activeRound || game.pollPending || game.cashoutPending) return;
     game.pollPending = true;
     const roundId = game.activeRound.id;
     try {
@@ -532,7 +539,7 @@
       if (result.status === "running") {
         // Estimate server clock offset for a smoother display; only server responses settle a round.
         if (Number.isFinite(Number(result.serverTime))) game.serverClockOffset = Number(result.serverTime) - Date.now();
-        scheduleAnimation();
+        if (!game.cashoutPending) scheduleAnimation();
         return;
       }
       await finishFromServerResult(result, roundId);
@@ -575,7 +582,6 @@
     game.active = true;
     game.recoveredRound = Boolean(recovered);
     game.multiplier = Math.min(MAX_MULTIPLIER, 1 + Math.max(0, (Date.now() - game.roundStartedAt) / 1000) * GROWTH_PER_SECOND);
-    game.wobbleSeed = Math.random() * Math.PI * 2;
     elements.multiplier.classList.add("live");
     elements.multiplier.classList.remove("busted");
     elements.meterTrack.classList.remove("busted");
@@ -699,11 +705,11 @@
     game.holdSource = source;
     game.activePointerId = source === "pointer" ? identifier : null;
     game.keyboardCode = source === "keyboard" ? identifier : null;
-    elements.holdButtonTitle.textContent = "CONNECTING...";
-    elements.holdButtonSubtitle.textContent = "Starting server-authoritative round";
+    elements.holdButtonTitle.textContent = "STARTING ROUND…";
+    elements.holdButtonSubtitle.textContent = "Placing your bet";
     elements.holdButton.classList.add("is-holding");
     elements.holdButton.setAttribute("aria-pressed", "true");
-    setMessage("Starting round with the game server…");
+    setMessage("Starting your round…");
     updateUI();
 
     const idempotencyKey = newIdempotencyKey();
@@ -717,9 +723,7 @@
       game.active = true;
       game.recoveredRound = false;
       game.multiplier = 1;
-      game.visualWobblePixels = 0;
-      game.wobbleSeed = Math.random() * Math.PI * 2;
-      game.lastSettledRoundId = null;
+          game.lastSettledRoundId = null;
       elements.multiplier.classList.add("live");
       elements.multiplier.classList.remove("busted");
       elements.meterTrack.classList.remove("busted");
@@ -766,6 +770,7 @@
       } catch { /* preserve the original request error below */ }
       elements.holdButtonTitle.textContent = "HOLD TO START";
       elements.holdButtonSubtitle.textContent = "Release to cash out";
+      setRoundStatus("READY");
       setMessage(error.message || "The server could not start the round.", "danger");
       updateUI();
     }
@@ -794,7 +799,6 @@
     clearHoldState();
     game.activeRound = null;
     game.activeBet = 0;
-    game.visualWobblePixels = 0;
     elements.multiplier.classList.remove("live");
     elements.meterTrack.classList.remove("is-running");
 
@@ -834,13 +838,27 @@
     updateUI();
   }
 
+  function showCashoutPending() {
+    // Give immediate feedback on release, while keeping the payout itself server-confirmed.
+    stopAnimation();
+    stopStatusPolling();
+    elements.holdButtonTitle.textContent = "CASHING OUT…";
+    elements.holdButtonSubtitle.textContent = "Confirming payout";
+    elements.holdButton.classList.remove("is-holding");
+    elements.holdButton.setAttribute("aria-pressed", "false");
+    setRoundStatus("CASHING OUT");
+    setMessage("Release received. Confirming your payout…");
+  }
+
   async function cashOut() {
     if (game.startPending) {
       game.releaseRequestedWhileStarting = true;
+      showCashoutPending();
       return;
     }
     if (!game.active || !game.activeRound || game.cashoutPending || game.recoveredRound) return;
     game.cashoutPending = true;
+    showCashoutPending();
     if (!game.activeRound.cashoutKey) game.activeRound.cashoutKey = newIdempotencyKey();
     const roundId = game.activeRound.id;
     try {
@@ -861,7 +879,10 @@
           }
         } catch { /* show the original message below */ }
       }
-      setMessage(`Cash-out response wasn't confirmed. Checking the server's round state. ${error.message}`, "danger");
+      elements.holdButtonTitle.textContent = "CHECKING RESULT";
+      elements.holdButtonSubtitle.textContent = "Waiting for server confirmation";
+      setRoundStatus("CHECKING");
+      setMessage(`Cash-out wasn't confirmed yet. Checking the round state. ${error.message}`, "danger");
       await pollRoundStatus();
     }
   }
@@ -871,6 +892,7 @@
       if (source === "pointer" && game.activePointerId !== identifier) return;
       if (source === "keyboard" && game.keyboardCode !== identifier) return;
       game.releaseRequestedWhileStarting = true;
+      showCashoutPending();
       return;
     }
     if (!game.active || game.holdSource !== source) return;
@@ -882,6 +904,7 @@
   function releaseAnyHold() {
     if (game.startPending) {
       game.releaseRequestedWhileStarting = true;
+      showCashoutPending();
       return;
     }
     if (game.active) void cashOut();

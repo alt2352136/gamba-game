@@ -224,19 +224,20 @@ main { padding: 26px 0 28px; }
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #8a4cf6 0%, #be93ff 52%, #f05b83 100%);
-  transition: width 55ms linear;
+  /* Updated every animation frame; avoid a trailing transition that separates the fill from its tip. */
 }
 .meter-wobble {
   position: absolute;
   z-index: 2;
   top: 50%;
   left: 0;
-  width: 14px;
-  height: 14px;
-  border: 2px solid #fbf8ff;
+  box-sizing: border-box;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #fbf8ff;
   border-radius: 50%;
   background: var(--rust);
-  box-shadow: 0 0 0 2px rgba(8, 10, 14, 0.68);
+  box-shadow: 0 0 3px rgba(240, 91, 131, 0.55);
   opacity: 0;
   pointer-events: none;
   transform: translate(-50%, -50%);
