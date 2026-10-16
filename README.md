@@ -11,15 +11,22 @@ A browser-based crash game built with vanilla JavaScript and a Cloudflare Worker
 - **Automated testing:** integration and regression coverage for concurrency, retries, round settlement, loans, seed verification, alarms and session isolation; GitHub Actions runs checks on pushes and pull requests.
 - **Responsive UI:** dependency-free HTML, CSS and JavaScript, pointer/keyboard controls, reduced-motion support and a compact mobile layout.
 
-## Outcome model
+## Crash-point generation
 
-Each round derives a digest from `HMAC-SHA-256(serverSeed, clientSeed:nonce)`. The first 52 digest bits define a value \(U \in [0,1)\). The crash multiplier is calculated with integer arithmetic and cent precision:
+Each round is derived from a deterministic HMAC-SHA-256 digest:
 
-\[
-C = \max\left(1.00,\frac{\lfloor(100-e)/(1-U)\rfloor}{100}\right)
-\]
+```text
+digest = HMAC-SHA-256(serverSeed, clientSeed:nonce)
+U = first_52_bits(digest) / 2^52
+crash_cents = max(100, floor((100 - e) / (1 - U)))
+crash_multiplier = crash_cents / 100
+```
 
-Here, \(e\) is the configured house edge in percentage points. The server commits to a seed before its rounds begin, then reveals it at rotation so recorded outcomes can be recomputed. Verification establishes consistency with the commitment and formula; it cannot prove that no round was omitted or that deployed code was never changed.
+`U` is in the range `[0, 1)`. The value `e` is the house edge in percentage points, so `1` means a 1% edge. The result is rounded down to whole cents, with a minimum crash multiplier of `1.00×`.
+
+### Seed verification
+
+Before using a server seed, the backend publishes its SHA-256 commitment. When that seed is rotated out, it is revealed so anyone can check the commitment and recompute recorded outcomes from the client seed and nonce. This verifies that the published records match the committed seed and formula; it does **not** prove that no round was omitted or that the deployed code was never changed.
 
 ## Engineering decisions
 
