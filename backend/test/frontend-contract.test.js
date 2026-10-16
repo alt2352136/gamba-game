@@ -64,7 +64,7 @@ test("loan exhaustion checks all defined tiers and tolerates partial server flag
 });
 
 test("round settlement chooses one modal path per server response", () => {
-  const match = js.match(/async function finishFromServerResult\(response, roundId\)\s*\{([\s\S]*?)\n  \}\n\n  function showCashoutPending/);
+  const match = js.match(/async function finishFromServerResult\(response, roundId, resultSource = "http"\)\s*\{([\s\S]*?)\n  \}\n\n  function showCashoutPending/);
   assert.ok(match, "Settlement handler should remain easy to audit");
   assert.match(match[1], /applyState\(response\.state, response\.profile, \{ updateModals: false \}\)/);
   assert.match(match[1], /if \(response\.defaultedLoan \|\| response\.state\.gameOver\)[\s\S]*?else if \(response\.state\.waitingForLoan && response\.state\.balance <= 0\)[\s\S]*?else \{/);
@@ -101,7 +101,7 @@ test("an uncertain cash-out result resumes status polling if the round is still 
 
 test("release during round startup uses a parallel, idempotent release intent", () => {
   assert.match(js, /function sendEarlyReleaseIntent\(\)[\s\S]*?api\("\/api\/round\/release-intent"/);
-  assert.match(js, /const startKey = game\.startRequestKey;[\s\S]*?body: \{ startKey \}/);
+  assert.match(js, /const startKey = game\.startRequestKey;[\s\S]*?body: \{ startKey, requestedMultiplierCents: 100 \}/);
   assert.match(js, /if \(response\.result && response\.roundId && response\.state\)/);
   assert.match(js, /releaseResult\?\.releaseMode === "settled"/);
 });
@@ -119,7 +119,7 @@ test("window blur during startup sends the same early-release intent path", () =
   const start = js.indexOf("function releaseAnyHold() {");
   const end = js.indexOf("function focusFirst", start);
   assert.ok(start >= 0 && end > start);
-  assert.match(js.slice(start, end), /if \(game\.startPending\)[\s\S]*?sendEarlyReleaseIntent\(\)/);
+  assert.match(js.slice(start, end), /if \(game\.startPending && game\.holdSource\)[\s\S]*?sendEarlyReleaseIntent\(\)/);
 });
 
 
@@ -150,7 +150,7 @@ test("client opens an authenticated WebSocket for prompt server settlement event
 
 test("server-push settlement is guarded against races with HTTP responses and polling", () => {
   assert.match(js, /game\.settlingRoundId === roundId/);
-  assert.match(js, /finishFromServerResult\(payload, payload\.roundId\)/);
+  assert.match(js, /finishFromServerResult\(payload, payload\.roundId, "websocket"\)/);
   assert.match(js, /if \(game\.activeRound\?\.id === payload\.roundId\)/);
 });
 
@@ -172,4 +172,33 @@ test("status fallback polls faster without a healthy settlement WebSocket", () =
   assert.match(match[1], /game\.eventSocket\?\.readyState === WebSocket\.OPEN/);
   assert.match(match[1], /const baseDelay = pushConnected \? STATUS_POLL_MS : STATUS_FALLBACK_POLL_MS/);
   assert.match(js, /Switch back to the low-traffic watchdog as soon as push delivery is healthy/);
+});
+
+
+test("cash-out sends the exact visible multiplier as a cent-rounded cap", () => {
+  assert.match(js, /function getVisibleMultiplierCents\(\)[\s\S]*?elements\.multiplier\.textContent/);
+  assert.match(js, /body: \{ roundId, requestedMultiplierCents \}/);
+  assert.match(js, /body: \{ startKey, requestedMultiplierCents: 100 \}/);
+  assert.match(js, /const shownCents = Math\.max\(100, Math\.min\(MAX_MULTIPLIER \* 100, Math\.floor\(game\.multiplier \* 100\)\)\)/);
+});
+
+
+test("hold control suppresses iOS text selection and touch callouts without removing keyboard support", () => {
+  assert.match(css, /-webkit-user-select:\s*none/);
+  assert.match(css, /-webkit-touch-callout:\s*none/);
+  assert.match(css, /-webkit-tap-highlight-color:\s*transparent/);
+  assert.match(css, /touch-action:\s*none/);
+  assert.match(js, /for \(const eventName of \["selectstart", "contextmenu", "dragstart"\]\)/);
+  assert.match(js, /event\.code !== "Space" && event\.code !== "Enter"/);
+});
+
+test("cash-out timing diagnostics are opt-in, local-only, and report client and server phases", () => {
+  assert.match(js, /gamba\.debugTiming/);
+  assert.match(js, /if \(!timingDebugEnabled\(\)\) \{\s*game\.cashoutTimingTrace = null;/);
+  assert.match(js, /releaseAt:\s*now/);
+  assert.match(js, /requestStartedAt, headersReceivedAt, bodyReceivedAt, status/);
+  assert.match(js, /releaseToResultMs/);
+  assert.match(js, /serverProcessingMs/);
+  assert.match(js, /No diagnostic data is uploaded separately/);
+  assert.match(js, /onTiming:\s*\(measurement\) => recordCashoutRequestTiming/);
 });

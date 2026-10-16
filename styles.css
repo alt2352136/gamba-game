@@ -274,10 +274,19 @@ main { padding: 26px 0 28px; }
   background: linear-gradient(160deg, rgba(255, 255, 255, 0.22), transparent 42%), linear-gradient(112deg, #bd69ff 0%, #974eff 34%, #763ce7 66%, #df477f 100%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), inset 0 -4px 0 rgba(33, 8, 62, 0.28), 0 9px 25px rgba(115, 53, 207, 0.34), 0 0 26px rgba(221, 71, 131, 0.10);
   cursor: pointer;
+  -webkit-user-select: none;
   user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-drag: none;
   touch-action: none;
   transform: translateY(0);
   transition: transform 130ms ease, filter 130ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+.hold-button, .hold-button * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 .hold-button::before {
   content: "";
@@ -319,7 +328,7 @@ main { padding: 26px 0 28px; }
 .hold-button:focus-visible { outline: 3px solid #ffffff; outline-offset: 4px; }
 .hold-button:disabled { cursor: not-allowed; opacity: 0.48; filter: saturate(0.45); transform: none; box-shadow: none; }
 .hold-button:disabled::after { display: none; }
-.hold-button-title { position: relative; z-index: 2; text-shadow: 0 1px 4px rgba(30, 5, 52, 0.4); font-size: 16px; font-weight: 820; letter-spacing: 0.065em; }
+.hold-button-title { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; pointer-events: none; position: relative; z-index: 2; text-shadow: 0 1px 4px rgba(30, 5, 52, 0.4); font-size: 16px; font-weight: 820; letter-spacing: 0.065em; }
 .game-panel-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .game-panel-footer strong { color: var(--text); font-weight: 700; }
 

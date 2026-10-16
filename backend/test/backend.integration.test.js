@@ -523,6 +523,49 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
         "Personal bests should persist across game resets.");
     });
 
+    await t.test("cash-out result never exceeds the multiplier sent by the visible release", async () => {
+      const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
+      assert.equal(fresh.status, 201, fresh.text);
+      const token = fresh.data.token;
+      const seed = await api(baseUrl, "/api/client-seed", {
+        method: "POST", token, body: { clientSeed: randomBytes(16).toString("hex") }
+      });
+      assert.equal(seed.status, 200, seed.text);
+
+      let matchedCap = false;
+      for (let attempt = 0; attempt < 12 && !matchedCap; attempt += 1) {
+        const startKey = idempotencyKey();
+        const started = await api(baseUrl, "/api/round/start", {
+          method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
+        });
+        assert.equal(started.status, 200, started.text);
+        if (started.data.result) continue; // A fast x1.00 crash is legitimately settled at start.
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const requestedMultiplierCents = 100;
+        let cashout = await api(baseUrl, "/api/round/cashout", {
+          method: "POST", token, headers: { "idempotency-key": idempotencyKey() },
+          body: { roundId: started.data.round.id, requestedMultiplierCents }
+        });
+        if (cashout.status === 409 && cashout.data?.error === "round_not_running") {
+          cashout = await api(baseUrl, `/api/round/status?id=${encodeURIComponent(started.data.round.id)}`, { token });
+        }
+        assert.equal(cashout.status, 200, cashout.text);
+        assert.ok(Number.isFinite(cashout.data.timing?.serverSettledAt), "Settlement responses should include a server settlement timestamp.");
+        assert.ok(cashout.data.timing?.settlementSource, "Settlement responses should identify what triggered settlement.");
+        if (cashout.data.timing?.serverReceivedAt !== null && cashout.data.timing?.serverReceivedAt !== undefined) {
+          assert.ok(Number.isFinite(cashout.data.timing.serverProcessingMs), "Request-triggered settlements should report server processing time.");
+        }
+        if (cashout.data.result === "cashed_out") {
+          assert.equal(cashout.data.multiplier, 1,
+            "A delayed successful request is capped at the multiplier displayed when release occurred.");
+          matchedCap = true;
+        } else {
+          assert.equal(cashout.data.result, "busted", "Requests processed after crash must still lose.");
+        }
+      }
+      assert.equal(matchedCap, true, "Expected at least one round to survive long enough to test the release cap.");
+    });
+
     await t.test("early release queued before round commit settles atomically at the x1 boundary", async () => {
       const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
       assert.equal(fresh.status, 201, fresh.text);
@@ -539,6 +582,8 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       });
       assert.equal(queued.status, 200, queued.text);
       assert.equal(queued.data.releaseMode, "queued");
+      assert.ok(Number.isFinite(queued.data.timing?.serverReceivedAt));
+      assert.ok(Number.isFinite(queued.data.timing?.serverProcessingMs));
 
       const started = await api(baseUrl, "/api/round/start", {
         method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
@@ -546,6 +591,9 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       assert.equal(started.status, 200, started.text);
       assert.ok(["cashed_out", "busted"].includes(started.data.result),
         `An early release must be settled in the start response: ${JSON.stringify(started.data)}`);
+      assert.ok(Number.isFinite(started.data.timing?.serverReceivedAt));
+      assert.ok(Number.isFinite(started.data.timing?.serverSettledAt));
+      assert.equal(started.data.timing?.settlementSource, "early-release-at-start");
       assert.equal(started.data.roundId, started.data.round.id);
       assert.equal(started.data.state.roundNumber, 1);
       assert.equal(started.data.state.activeRound, null);
@@ -583,6 +631,7 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       assert.equal(release.status, 200, release.text);
       assert.equal(release.data.releaseMode, "settled");
       assert.ok(["cashed_out", "busted"].includes(release.data.result || release.data.status));
+      assert.ok(Number.isFinite(release.data.timing?.serverSettledAt));
       assert.equal(release.data.state.activeRound, null);
       assert.equal(release.data.state.roundNumber, 1);
 

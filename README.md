@@ -9,7 +9,7 @@ A browser-based crash game built with vanilla JavaScript and Cloudflare Workers.
 - **Low-latency round handling:** An authenticated WebSocket pushes settlement events. An idempotent release-intent endpoint handles a release that arrives while round startup is still in flight, avoiding an unnecessary sequential request. Adaptive status polling provides recovery when push is unavailable; settlement remains server-controlled.
 - **Security controls:** Signed session tokens, exact-origin CORS, bounded request bodies, and Cloudflare-managed secrets protect the API boundary. Non-extractable `CryptoKey` objects are cached for warm requests without caching a plaintext server seed as a long-lived field.
 - **Regression tests and CI:** Node tests cover deterministic outcomes, malformed requests, authentication, duplicate operations, concurrent starts, loan rules, alarms, and event-delivery recovery. GitHub Actions runs checks on pushes and pull requests.
-- **Efficient client rendering:** The cosmic dust field is rasterized once and moved with CSS rather than recalculating every particle per frame. The client pauses work when the page is hidden, requests only the ten history entries it displays, and supports keyboard controls, reduced motion, and narrow screens.
+- **Efficient client rendering:** The cosmic dust field is rasterized once and moved with CSS rather than recalculating every particle per frame. The client pauses work when the page is hidden, requests only the ten history entries it displays, and uses pointer capture with touch-selection suppression plus keyboard controls for the hold interaction.
 
 ## How the crash multiplier is calculated
 
@@ -27,9 +27,13 @@ crashMultiplier = crashCents / 100
 
 ### Timing and verification limits
 
-The browser estimates the multiplier from a server timestamp using `performance.now()`, so changes to the local system clock do not drive the display. The multiplier is still a client-side estimate: network delivery and platform scheduling can delay a visual update. Cash-out eligibility, crash outcomes, balances, and payouts are decided by the server's clock and state. The crash point is not sent while a round is running.
+The browser estimates the multiplier from a server timestamp using `performance.now()`, so changes to the local system clock do not drive the display. On release, the client sends the cent-rounded multiplier it actually displayed as a **maximum requested payout multiplier**. The server still checks the committed crash point against its own clock first, and caps a successful cash-out at the lower of that request and the server's live multiplier; a request that arrives after the crash still loses. If a release reaches the server at the x10 boundary before the automatic alarm settles the round, the same visible-value cap applies. If the automatic x10 settlement commits first, its result stands. This avoids upward jumps in successful cash-out results without trusting the client to declare that a round survived. Network delivery and platform scheduling can still delay crash notifications, and the display remains an estimate. The crash point is not sent while a round is running.
 
 The server publishes a SHA-256 commitment before using a seed and reveals the seed at rotation. This lets anyone recompute recorded results against the commitment and formula, but it does not prove the completeness of the public history or the immutability of deployed code.
+
+### Timing diagnostics
+
+To inspect a round locally, open DevTools, run `localStorage.setItem("gamba.debugTiming", "1")`, and reload the page. The Console reports release-to-result time, request-to-response duration, server receive-to-settlement time, and whether the result arrived over HTTP or WebSocket. Disable it with `localStorage.removeItem("gamba.debugTiming")` and reload. Diagnostics stay in the browser console; the game does not upload separate telemetry. Client monotonic times and server wall-clock timestamps are different clocks, so do not subtract them to infer one-way network latency.
 
 ## Run locally
 
