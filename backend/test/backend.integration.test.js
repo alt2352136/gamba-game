@@ -277,6 +277,7 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
     });
     assert.equal(firstStart.status, 200, firstStart.text);
     assert.equal(firstStart.data.state.balance, STARTING_GOLD - 1);
+    assert.ok(Number.isFinite(firstStart.data.serverTime), "Start response must include a server-clock sample.");
     assert.equal(Object.hasOwn(firstStart.data, "crashPoint"), false, "Crash point must not be sent while round is running.");
     const firstRoundId = firstStart.data.round.id;
 
@@ -290,6 +291,7 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       });
       assert.equal(replayStart.status, 200, replayStart.text);
       assert.equal(replayStart.data.round.id, firstRoundId);
+      assert.ok(Number.isFinite(replayStart.data.serverTime), "Idempotent replay should get a fresh server-clock sample.");
       const roundsAfterReplay = await api(baseUrl, "/api/fairness?limit=10", { token: auth });
       assert.equal(roundsAfterReplay.status, 200);
       assert.equal(roundsAfterReplay.data.totalRounds, roundsBeforeReplay.data.totalRounds,
@@ -624,7 +626,7 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       assert.equal(fairness.data.totalRounds, 12, "Public-history trimming must not delete fairness records.");
     });
 
-    await t.test("Durable Object alarm settles a round without any status poll or browser request", { timeout: 25_000 }, async () => {
+    await t.test("Durable Object alarm pushes settlement without any status poll", { timeout: 25_000 }, async () => {
       const isolated = await api(baseUrl, "/api/session", { method: "POST", body: {} });
       assert.equal(isolated.status, 201, isolated.text);
       const isolatedToken = isolated.data.token;
@@ -632,20 +634,135 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
         method: "POST", token: isolatedToken, body: { clientSeed: randomBytes(16).toString("hex") }
       });
       assert.equal(setSeed.status, 200, setSeed.text);
-      const started = await api(baseUrl, "/api/round/start", {
-        method: "POST", token: isolatedToken, headers: { "idempotency-key": idempotencyKey() }, body: { stake: 1 }
-      });
-      assert.equal(started.status, 200, started.text);
-      assert.ok(started.data.round.id);
 
-      // Maximum run time to x10 is 11.25s. Do not call round/status while waiting: only the alarm
-      // should settle the round, demonstrating recovery when a browser is disconnected.
-      await pause(12_500);
-      const recovered = await api(baseUrl, "/api/state", { token: isolatedToken });
-      assert.equal(recovered.status, 200, recovered.text);
-      assert.equal(recovered.data.state.activeRound, null, "the server alarm should settle the active round");
-      assert.equal(recovered.data.state.roundNumber, 1);
-      assert.equal(recovered.data.profile.stats.roundsPlayed, 1);
+      const socket = new WebSocket(`${baseUrl.replace(/^http:/, "ws:")}/api/round/events`,
+        ["gamba-events-v1", `gamba-auth.${isolatedToken}`]);
+      const messages = [];
+      const waiters = [];
+      socket.addEventListener("message", (event) => {
+        let payload;
+        try { payload = JSON.parse(event.data); } catch { return; }
+        messages.push(payload);
+        for (let i = waiters.length - 1; i >= 0; i -= 1) {
+          if (!waiters[i].predicate(payload)) continue;
+          clearTimeout(waiters[i].timer);
+          waiters[i].resolve(payload);
+          waiters.splice(i, 1);
+        }
+      });
+      const waitFor = (predicate, timeoutMs = 15_000) => {
+        const existing = messages.find(predicate);
+        if (existing) return Promise.resolve(existing);
+        return new Promise((resolve, reject) => {
+          const waiter = { predicate, resolve, reject, timer: null };
+          waiter.timer = setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) waiters.splice(index, 1);
+            reject(new Error("Timed out waiting for the alarm settlement push."));
+          }, timeoutMs);
+          waiters.push(waiter);
+        });
+      };
+      try {
+        await Promise.race([
+          new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("WebSocket handshake timed out.")), 5000);
+            socket.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
+            socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("WebSocket connection failed.")); }, { once: true });
+          })
+        ]);
+        await waitFor((message) => message.type === "ready", 5000);
+        assert.equal(socket.protocol, "gamba-events-v1", "The bearer token subprotocol must never be echoed back.");
+        const started = await api(baseUrl, "/api/round/start", {
+          method: "POST", token: isolatedToken, headers: { "idempotency-key": idempotencyKey() }, body: { stake: 1 }
+        });
+        assert.equal(started.status, 200, started.text);
+        const roundId = started.data.round.id;
+        assert.ok(roundId);
+
+        // Do not request /api/round/status while waiting. The Durable Object alarm itself must
+        // settle the round and publish the same authoritative result over the live socket.
+        const pushed = await waitFor((message) => message.type === "round-settled" && message.roundId === roundId);
+        assert.ok(["cashed_out", "busted"].includes(pushed.result));
+        assert.equal(pushed.state.activeRound, null);
+        assert.equal(pushed.state.roundNumber, 1);
+
+        const recovered = await api(baseUrl, "/api/state", { token: isolatedToken });
+        assert.equal(recovered.status, 200, recovered.text);
+        assert.equal(recovered.data.state.activeRound, null, "the server alarm should settle the active round");
+        assert.equal(recovered.data.state.roundNumber, 1);
+        assert.equal(recovered.data.profile.stats.roundsPlayed, 1);
+      } finally {
+        try { socket.close(); } catch { /* already closed */ }
+        for (const waiter of waiters) clearTimeout(waiter.timer);
+      }
+    });
+
+    await t.test("authenticated WebSocket receives settlement events without waiting for status polling", async () => {
+      const fresh = await api(baseUrl, "/api/session", { method: "POST", body: {} });
+      assert.equal(fresh.status, 201, fresh.text);
+      const token = fresh.data.token;
+      const seed = await api(baseUrl, "/api/client-seed", {
+        method: "POST", token, body: { clientSeed: randomBytes(16).toString("hex") }
+      });
+      assert.equal(seed.status, 200, seed.text);
+
+      const wsBase = baseUrl.replace(/^http:/, "ws:");
+      const socket = new WebSocket(`${wsBase}/api/round/events`, ["gamba-events-v1", `gamba-auth.${token}`]);
+      const seen = [];
+      const waiters = [];
+      socket.addEventListener("message", (event) => {
+        let payload;
+        try { payload = JSON.parse(event.data); } catch { return; }
+        seen.push(payload);
+        for (let i = waiters.length - 1; i >= 0; i -= 1) {
+          if (!waiters[i].predicate(payload)) continue;
+          clearTimeout(waiters[i].timer);
+          waiters[i].resolve(payload);
+          waiters.splice(i, 1);
+        }
+      });
+      const waitFor = (predicate, timeoutMs = 5000) => {
+        const existing = seen.find(predicate);
+        if (existing) return Promise.resolve(existing);
+        return new Promise((resolve, reject) => {
+          const waiter = { predicate, resolve, reject, timer: null };
+          waiter.timer = setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) waiters.splice(index, 1);
+            reject(new Error("Timed out waiting for WebSocket settlement event."));
+          }, timeoutMs);
+          waiters.push(waiter);
+        });
+      };
+      try {
+        await Promise.race([
+          new Promise((resolve, reject) => {
+            socket.addEventListener("open", resolve, { once: true });
+            socket.addEventListener("error", () => reject(new Error("WebSocket connection failed.")), { once: true });
+          }),
+          pause(5000).then(() => { throw new Error("WebSocket handshake timed out."); })
+        ]);
+        await waitFor((message) => message.type === "ready");
+        const startKey = idempotencyKey();
+        const started = await api(baseUrl, "/api/round/start", {
+          method: "POST", token, headers: { "idempotency-key": startKey }, body: { stake: 1 }
+        });
+        assert.equal(started.status, 200, started.text);
+        assert.ok(started.data.round.id);
+        const roundId = started.data.round.id;
+        const cashout = await api(baseUrl, "/api/round/cashout", {
+          method: "POST", token, headers: { "idempotency-key": idempotencyKey() }, body: { roundId }
+        });
+        assert.ok(cashout.status === 200 || (cashout.status === 409 && cashout.data.error === "round_not_running"), cashout.text);
+        const pushed = await waitFor((message) => message.type === "round-settled" && message.roundId === roundId);
+        assert.ok(["cashed_out", "busted"].includes(pushed.result));
+        assert.equal(pushed.state.activeRound, null);
+        assert.equal(pushed.state.roundNumber, 1);
+      } finally {
+        try { socket.close(); } catch { /* already closed */ }
+        for (const waiter of waiters) clearTimeout(waiter.timer);
+      }
     });
 
     await t.test("does not allow ending a healthy game with a positive balance", async () => {

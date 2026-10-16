@@ -139,3 +139,37 @@ test("fallback cash-out reuses the release-intent idempotency key", () => {
   assert.match(js, /game\.activeRound = \{ \.\.\.response\.round, cashoutKey: released \? game\.releaseCashoutKey : null \}/);
   assert.match(js, /if \(game\.activeRound\) game\.activeRound\.cashoutKey = releaseCashoutKey \|\| null/);
 });
+
+
+test("client opens an authenticated WebSocket for prompt server settlement events", () => {
+  assert.match(js, /new WebSocket\(`\$\{wsBase\}\/api\/round\/events`, \["gamba-events-v1", `gamba-auth\.\$\{game\.token\}`\]\)/);
+  assert.match(js, /payload\.type !== "round-settled"/);
+  assert.match(js, /pendingSettlementEvent/);
+  assert.match(js, /scheduleEventReconnect/);
+});
+
+test("server-push settlement is guarded against races with HTTP responses and polling", () => {
+  assert.match(js, /game\.settlingRoundId === roundId/);
+  assert.match(js, /finishFromServerResult\(payload, payload\.roundId\)/);
+  assert.match(js, /if \(game\.activeRound\?\.id === payload\.roundId\)/);
+});
+
+
+test("round multiplier uses a server-anchored monotonic clock and syncs on start", () => {
+  assert.match(js, /function estimatedServerTime\(\)[\s\S]*?performance\.now\(\)/);
+  assert.match(js, /syncServerClock\(response\.serverTime\)/);
+  const match = js.match(/function updateRoundFrame\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert.ok(match, "The frame updater should remain easy to audit");
+  assert.match(match[1], /estimatedServerTime\(\) - Number\(game\.activeRound\.startedAt\)/);
+  assert.doesNotMatch(match[1], /Date\.now\(\)/, "Local wall-clock skew must not drive the multiplier");
+});
+
+
+test("status fallback polls faster without a healthy settlement WebSocket", () => {
+  assert.match(js, /const STATUS_FALLBACK_POLL_MS = 250/);
+  const match = js.match(/function scheduleStatusPoll\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert.ok(match, "Status polling should remain a small, auditable function");
+  assert.match(match[1], /game\.eventSocket\?\.readyState === WebSocket\.OPEN/);
+  assert.match(match[1], /const baseDelay = pushConnected \? STATUS_POLL_MS : STATUS_FALLBACK_POLL_MS/);
+  assert.match(js, /Switch back to the low-traffic watchdog as soon as push delivery is healthy/);
+});

@@ -226,15 +226,29 @@ export default {
         return json({ sessionId, token, ...(await result.json()) }, 201, cors);
       }
 
+      const isEventSocket = request.method === "GET" && url.pathname === "/api/round/events" &&
+        request.headers.get("upgrade")?.toLowerCase() === "websocket";
       const auth = request.headers.get("authorization") || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+      let token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+      // Browser WebSocket APIs cannot set Authorization headers. Carry the session token in a
+      // negotiated subprotocol (never in the URL), and still verify the same signed token.
+      if (isEventSocket && !token) {
+        const protocols = String(request.headers.get("sec-websocket-protocol") || "")
+          .split(",").map(value => value.trim());
+        const authProtocol = protocols.find(value => value.startsWith("gamba-auth."));
+        if (authProtocol) token = authProtocol.slice("gamba-auth.".length);
+      }
       const sessionId = await verifySessionToken(token, env.SESSION_SECRET || "");
       if (!sessionId) return json({ error: "unauthorized" }, 401, cors);
       if (!url.pathname.startsWith("/api/")) return json({ error: "not_found" }, 404, cors);
       const id = env.GAME_SESSIONS.idFromName(sessionId);
       const stub = env.GAME_SESSIONS.get(id);
-      const forwarded = new Request(`https://session.internal${url.pathname}${url.search}`, request);
+      // Preserve the original upgrade request for WebSockets; ordinary API requests use
+      // the internal origin so route handling does not depend on the public hostname.
+      const forwarded = isEventSocket ? request : new Request(`https://session.internal${url.pathname}${url.search}`, request);
       const response = await stub.fetch(forwarded);
+      // Re-wrapping a 101 response would discard the WebSocket upgrade.
+      if (isEventSocket && response.status === 101) return response;
       const headers = new Headers(response.headers);
       for (const [k, v] of Object.entries(cors)) headers.set(k, v);
       return new Response(response.body, { status: response.status, headers });
@@ -458,6 +472,7 @@ export class GameSession {
   async fetch(request) {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/api/round/events" && request.method === "GET") return this.openRoundEvents(request);
       if (url.pathname === "/internal/init" && request.method === "POST") return await this.initialize(await readJsonLimited(request));
       if (url.pathname === "/api/state" && request.method === "GET") return this.stateResponse();
       if (url.pathname === "/api/client-seed" && request.method === "POST") return await this.setClientSeed(await readJsonLimited(request));
@@ -483,6 +498,50 @@ export class GameSession {
       const requestId = crypto.randomUUID();
       // Keep client responses generic; requestId lets operators correlate provider logs.
       return json({ error: "internal_error", requestId }, 500);
+    }
+  }
+
+  openRoundEvents(request) {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return json({ error: "websocket_upgrade_required" }, 426, { upgrade: "websocket" });
+    }
+    const protocols = String(request.headers.get("sec-websocket-protocol") || "")
+      .split(",").map(value => value.trim());
+    if (!protocols.includes("gamba-events-v1")) return json({ error: "websocket_protocol_required" }, 400);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server);
+    // The token-bearing subprotocol is not selected or echoed to the browser.
+    server.send(JSON.stringify({ type: "ready", serverTime: Date.now() }));
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: { "sec-websocket-protocol": "gamba-events-v1", "cache-control": "no-store" }
+    });
+  }
+
+  webSocketMessage(socket, message) {
+    // This channel is server-push only. Ignore client data rather than treating it as gameplay input.
+    if (typeof message === "string" && message.length > 0) {
+      try { socket.send(JSON.stringify({ type: "error", error: "server_push_only" })); } catch { /* disconnected */ }
+    }
+  }
+
+  webSocketClose() {}
+  webSocketError() {}
+
+  broadcastRoundSettled(response, roundId, startKey = null) {
+    const message = JSON.stringify({
+      ...response,
+      type: "round-settled",
+      roundId,
+      ...(startKey ? { startKey } : {}),
+      serverTime: Date.now()
+    });
+    let sockets = [];
+    try { sockets = this.ctx.getWebSockets(); } catch { return; }
+    for (const socket of sockets) {
+      try { socket.send(message); } catch { /* A stale socket must not block durable settlement. */ }
     }
   }
 
@@ -523,7 +582,7 @@ export class GameSession {
       this.sql.exec("INSERT INTO seeds(epoch,commitment,seed_iv,seed_cipher,created_at) VALUES(1,?,?,?,?)", commitment, encrypted.iv, encrypted.ciphertext, Date.now());
       this.sql.exec("INSERT OR IGNORE INTO session_stats(id,updated_at) VALUES(1,?)", Date.now());
     });
-    return json({ state: this.publicState(state), commitment, epoch: 1, clientSeedRequired: true, profile: this.profileData() });
+    return json({ state: this.publicState(state), commitment, epoch: 1, clientSeedRequired: true, serverTime: Date.now(), profile: this.profileData() });
   }
 
   publicState(state, activeRoundOverride = undefined) {
@@ -547,7 +606,7 @@ export class GameSession {
   stateResponse() {
     const state = this.readState();
     if (!state) return json({ error: "session_not_initialized" }, 409);
-    return json({ state: this.publicState(state), commitment: this.currentCommitment(), epoch: state.currentEpoch, profile: this.profileData() });
+    return json({ state: this.publicState(state), commitment: this.currentCommitment(), epoch: state.currentEpoch, serverTime: Date.now(), profile: this.profileData() });
   }
 
   async setClientSeed(body) {
@@ -651,9 +710,9 @@ export class GameSession {
     // an intent associated with this same in-flight idempotency key.
     this.sql.exec("DELETE FROM early_release_intents WHERE created_at < ?", Date.now() - 60_000);
     const cached = this.cachedIdempotent(idempotencyKey, "round-start");
-    if (cached) return json(cached);
+    if (cached) return json({ ...cached, serverTime: Date.now() });
     const existing = this.sql.exec("SELECT response_json FROM rounds WHERE idempotency_key=?", idempotencyKey).toArray()[0];
-    if (existing?.response_json) return json(safeParse(existing.response_json, { error: "idempotency_replay" }));
+    if (existing?.response_json) return json({ ...safeParse(existing.response_json, { error: "idempotency_replay" }), serverTime: Date.now() });
     if (state.gameOver) throw new ApiError(409, "game_over", "Start a new game before playing again.");
     if (state.waitingForLoan) throw new ApiError(409, "loan_decision_required", "Take a loan or end the game before starting another round.");
     if (!state.clientSeed) throw new ApiError(409, "client_seed_required", "Set a client seed before starting a round.");
@@ -680,7 +739,7 @@ export class GameSession {
     const roundPayload = { id: roundId, nonce, epoch, stake, startedAt, commitment: seedRow.commitment };
     let response;
     const duplicateAfterCrypto = this.cachedIdempotent(idempotencyKey, "round-start");
-    if (duplicateAfterCrypto) return json(duplicateAfterCrypto);
+    if (duplicateAfterCrypto) return json({ ...duplicateAfterCrypto, serverTime: Date.now() });
 
     this.ctx.storage.transactionSync(() => {
       // Recheck under the serialized SQLite transaction to reject concurrent starts.
@@ -736,15 +795,20 @@ export class GameSession {
     });
 
     if (!response.result) {
-      // One Durable Object alarm settles the round if the browser disconnects. Alarm persistence
+      // One Durable Object alarm settles a round if the browser disconnects. Alarm persistence
       // remains on the start path; it must be durable before the server confirms the round.
       try {
         await this.ctx.storage.setAlarm(this.settlementAt({ started_at: startedAt, crash_point: crashPoint }));
       } catch (error) {
         console.error("Round alarm scheduling failed", { roundId, errorName: error?.name || "Error" });
       }
+    } else {
+      this.broadcastRoundSettled(response, roundId, idempotencyKey);
     }
-    return json(response.result ? response : { ...response, crashPoint: undefined });
+    const serverTime = Date.now();
+    return json(response.result
+      ? { ...response, serverTime }
+      : { ...response, crashPoint: undefined, serverTime });
   }
 
   settleRound(round, state, result, multiplier, payout, now) {
@@ -803,6 +867,7 @@ export class GameSession {
         repayments: settled.repayments, defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       this.storeIdempotent(idempotencyKey, "cashout", response);
     });
+    this.broadcastRoundSettled(response, roundId, round.idempotency_key);
     this.deferSettlementAlarmCleanup(roundId);
     return json(response);
   }
@@ -830,6 +895,7 @@ export class GameSession {
         defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       if (idempotencyKey) this.storeIdempotent(idempotencyKey, "cashout", response);
     });
+    this.broadcastRoundSettled(response, round.id, round.idempotency_key);
     this.deferSettlementAlarmCleanup(round.id);
     return json(response);
   }
@@ -857,6 +923,7 @@ export class GameSession {
         defaultedLoan: settled.defaultedLoan, profile: this.profileData() };
       if (idempotencyKey) this.storeIdempotent(idempotencyKey, "cashout", response);
     });
+    this.broadcastRoundSettled(response, round.id, round.idempotency_key);
     this.deferSettlementAlarmCleanup(round.id);
     return response;
   }

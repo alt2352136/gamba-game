@@ -14,6 +14,9 @@
   const MAX_MULTIPLIER = 10;
   // Lower request traffic; the server alarm settles rounds even when no browser is connected.
   const STATUS_POLL_MS = 1000;
+  // If push events are not connected, poll more frequently so a short crash is not hidden
+  // for a full second. Keep the slower watchdog while the WebSocket is healthy.
+  const STATUS_FALLBACK_POLL_MS = 250;
   const API_REQUEST_TIMEOUT_MS = 12_000;
   const LOANS = {
     444: { principal: 444, repayment: 533, rounds: 8, tier: "STARTER" },
@@ -90,7 +93,8 @@
     activeBet: 0,
     multiplier: 1,
     roundStartedAt: 0,
-    serverClockOffset: 0,
+    serverTimeAnchor: null,
+    performanceTimeAnchor: null,
     activeRound: null,
     active: false,
     recoveredRound: false,
@@ -112,6 +116,11 @@
     pollPending: false,
     pollAbortController: null,
     statusFailureCount: 0,
+    eventSocket: null,
+    eventReconnectTimer: null,
+    eventReconnectAttempts: 0,
+    pendingSettlementEvent: null,
+    settlingRoundId: null,
     lastSettledRoundId: null,
     gameOver: false,
     waitingForLoan: false,
@@ -449,6 +458,27 @@
     elements.bankLoanButton.disabled = !canBorrow || allTaken || game.loanPending;
   }
 
+  function estimatedServerTime() {
+    if (Number.isFinite(game.serverTimeAnchor) && Number.isFinite(game.performanceTimeAnchor)) {
+      return game.serverTimeAnchor + (performance.now() - game.performanceTimeAnchor);
+    }
+    return Date.now();
+  }
+
+  function syncServerClock(serverTime) {
+    if (serverTime === null || serverTime === undefined || !Number.isFinite(Number(serverTime))) return;
+    const incoming = Number(serverTime);
+    const receivedAt = performance.now();
+    const projected = Number.isFinite(game.serverTimeAnchor) && Number.isFinite(game.performanceTimeAnchor)
+      ? game.serverTimeAnchor + (receivedAt - game.performanceTimeAnchor)
+      : null;
+    // Server timestamps are emitted before network delivery. Re-anchor without moving the
+    // estimated clock backward, and use performance.now() so system clock adjustments cannot
+    // make the visible multiplier jump ahead or rewind.
+    game.serverTimeAnchor = projected === null ? incoming : Math.max(projected, incoming);
+    game.performanceTimeAnchor = receivedAt;
+  }
+
   function updateMultiplierDisplay() {
     elements.multiplier.textContent = `x${game.multiplier.toFixed(2)}`;
     elements.meterTrack.setAttribute("aria-valuenow", game.multiplier.toFixed(2));
@@ -542,7 +572,7 @@
   function updateRoundFrame() {
     game.animationFrameId = null;
     if (!game.active || !game.activeRound || game.cashoutPending) return;
-    const elapsed = Math.max(0, (Date.now() + game.serverClockOffset - Number(game.activeRound.startedAt)) / 1000);
+    const elapsed = Math.max(0, (estimatedServerTime() - Number(game.activeRound.startedAt)) / 1000);
     game.multiplier = Math.min(MAX_MULTIPLIER, 1 + elapsed * GROWTH_PER_SECOND);
     // This animation is cosmetic. Only the server decides if a cash-out beats the crash.
     updateMultiplierDisplay();
@@ -552,9 +582,11 @@
   function scheduleStatusPoll() {
     stopStatusPolling();
     if (!game.active || !game.activeRound || document.hidden || game.cashoutPending) return;
+    const pushConnected = typeof WebSocket === "function" && game.eventSocket?.readyState === WebSocket.OPEN;
+    const baseDelay = pushConnected ? STATUS_POLL_MS : STATUS_FALLBACK_POLL_MS;
     const retryDelay = game.statusFailureCount > 0
-      ? Math.min(30_000, STATUS_POLL_MS * (2 ** Math.min(game.statusFailureCount, 5)))
-      : STATUS_POLL_MS;
+      ? Math.min(30_000, baseDelay * (2 ** Math.min(game.statusFailureCount, 5)))
+      : baseDelay;
     game.pollTimerId = setTimeout(async () => {
       game.pollTimerId = null;
       await pollRoundStatus();
@@ -575,7 +607,7 @@
       game.statusFailureCount = 0;
       if (result.status === "running") {
         // Estimate server clock offset for a smoother display; only server responses settle a round.
-        if (Number.isFinite(Number(result.serverTime))) game.serverClockOffset = Number(result.serverTime) - Date.now();
+        syncServerClock(result.serverTime);
         if (!game.cashoutPending) scheduleAnimation();
         return;
       }
@@ -621,7 +653,7 @@
     game.roundStartedAt = Number(activeRound.startedAt);
     game.active = true;
     game.recoveredRound = Boolean(recovered);
-    game.multiplier = Math.min(MAX_MULTIPLIER, 1 + Math.max(0, (Date.now() - game.roundStartedAt) / 1000) * GROWTH_PER_SECOND);
+    game.multiplier = Math.min(MAX_MULTIPLIER, 1 + Math.max(0, (estimatedServerTime() - game.roundStartedAt) / 1000) * GROWTH_PER_SECOND);
     elements.multiplier.classList.add("live");
     elements.multiplier.classList.remove("busted");
     elements.meterTrack.classList.remove("busted");
@@ -670,6 +702,59 @@
     }
   }
 
+  function scheduleEventReconnect() {
+    if (game.eventReconnectTimer !== null || !game.token || document.hidden) return;
+    const delay = Math.min(15_000, 500 * (2 ** Math.min(game.eventReconnectAttempts, 5)));
+    game.eventReconnectAttempts = Math.min(game.eventReconnectAttempts + 1, 5);
+    game.eventReconnectTimer = setTimeout(() => {
+      game.eventReconnectTimer = null;
+      connectRoundEvents();
+    }, delay);
+  }
+
+  function connectRoundEvents() {
+    if (typeof WebSocket !== "function" || !API_BASE || !game.token || document.hidden) return;
+    if (game.eventSocket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(game.eventSocket.readyState)) return;
+    const wsBase = API_BASE.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+    let socket;
+    try {
+      // WebSocket cannot set Authorization headers; the Worker verifies this signed token
+      // from a subprotocol, never from a query string, then selects only gamba-events-v1.
+      socket = new WebSocket(`${wsBase}/api/round/events`, ["gamba-events-v1", `gamba-auth.${game.token}`]);
+    } catch {
+      scheduleEventReconnect();
+      return;
+    }
+    game.eventSocket = socket;
+    socket.addEventListener("open", () => {
+      if (game.eventSocket !== socket) return;
+      game.eventReconnectAttempts = 0;
+      // Switch back to the low-traffic watchdog as soon as push delivery is healthy.
+      if (game.active) scheduleStatusPoll();
+    });
+    socket.addEventListener("message", (event) => {
+      let payload;
+      try { payload = JSON.parse(event.data); } catch { return; }
+      syncServerClock(payload.serverTime);
+      if (payload.type !== "round-settled" || !payload.roundId) return;
+      if (game.activeRound?.id === payload.roundId) {
+        void finishFromServerResult(payload, payload.roundId);
+      } else if (game.startPending && payload.startKey && payload.startKey === game.startRequestKey) {
+        // A very fast crash may settle before the start HTTP response reaches this browser.
+        game.pendingSettlementEvent = payload;
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (game.eventSocket !== socket) return;
+      game.eventSocket = null;
+      if (game.active) scheduleStatusPoll();
+      scheduleEventReconnect();
+    });
+    socket.addEventListener("error", () => {
+      try { socket.close(); } catch { /* close event performs reconnect */ }
+    });
+  }
+
   async function initializeBackend() {
     if (!API_BASE) throw new Error("Backend URL is not configured. Open backend-config.js and set GAMBA_API_BASE.");
     const stored = readStoredSession();
@@ -678,6 +763,7 @@
       game.token = stored.token;
       try {
         const snapshot = await api("/api/state");
+        syncServerClock(snapshot.serverTime);
         updateCommitment(snapshot);
         applyState(snapshot.state, snapshot.profile);
         game.ready = true;
@@ -689,6 +775,7 @@
         else showRecoveredLastResult(snapshot.state);
         updateUI();
         renderFairness();
+        connectRoundEvents();
         return;
       } catch (error) {
         if (error.status !== 401) throw error;
@@ -703,6 +790,7 @@
     game.sessionId = created.sessionId;
     game.token = created.token;
     storeSession();
+    syncServerClock(created.serverTime);
     updateCommitment(created);
     applyState(created.state, created.profile);
     // The session response already contains state/profile. Set the client seed directly to avoid
@@ -713,10 +801,12 @@
     setMessage("Connected securely. Ready to play.", "success");
     updateUI();
     renderFairness();
+    connectRoundEvents();
   }
 
   async function refreshState() {
     const snapshot = await api("/api/state");
+    syncServerClock(snapshot.serverTime);
     updateCommitment(snapshot);
     applyState(snapshot.state, snapshot.profile);
     if (snapshot.state.activeRound && (!game.activeRound || game.activeRound.id !== snapshot.state.activeRound.id)) {
@@ -778,6 +868,7 @@
     updateUI();
 
     const idempotencyKey = newIdempotencyKey();
+    game.pendingSettlementEvent = null;
     const roundNumberBeforeStart = game.roundNumber;
     let startRequestWasSent = false;
     game.startRequestKey = idempotencyKey;
@@ -793,6 +884,7 @@
       const startRequest = api("/api/round/start", { method: "POST", body: { stake }, idempotencyKey });
       startRequestWasSent = true;
       const response = await startRequest;
+      syncServerClock(response.serverTime);
       const released = game.releaseRequestedWhileStarting;
       game.startPending = false;
 
@@ -802,6 +894,14 @@
         game.releaseRequestedWhileStarting = false;
         clearPendingStartTracking();
         await finishFromServerResult(response, response.roundId);
+        return;
+      }
+      const pendingSettlement = game.pendingSettlementEvent;
+      if (pendingSettlement?.startKey === idempotencyKey && pendingSettlement.roundId === response.round?.id) {
+        game.pendingSettlementEvent = null;
+        game.releaseRequestedWhileStarting = false;
+        clearPendingStartTracking();
+        await finishFromServerResult(pendingSettlement, pendingSettlement.roundId);
         return;
       }
 
@@ -902,13 +1002,21 @@
   }
 
   async function finishFromServerResult(response, roundId) {
-    if (!roundId || game.lastSettledRoundId === roundId) return;
+    if (!roundId || game.lastSettledRoundId === roundId || game.settlingRoundId === roundId) return;
     let result = response.result || response.status;
     if (result === "running") return;
-    if (!response.state) {
-      const snapshot = await api("/api/state");
-      response.state = snapshot.state;
-      updateCommitment(snapshot);
+    game.settlingRoundId = roundId;
+    try {
+      if (!response.state) {
+        const snapshot = await api("/api/state");
+        response.state = snapshot.state;
+        updateCommitment(snapshot);
+      }
+    } catch (error) {
+      if (game.settlingRoundId === roundId) game.settlingRoundId = null;
+      setMessage(`Round settled, but refreshing the wallet failed. Reconnecting… ${error.message}`, "danger");
+      void refreshState().catch(() => {});
+      return;
     }
     const historyItem = response.historyItem || (response.state.history || []).find((item) => item.roundId === roundId) || null;
     // Settling endpoints include a bust crash point. Avoid a second API request for presentation.
@@ -961,6 +1069,7 @@
       elements.loanModal.classList.add("hidden");
     }
     updateUI();
+    if (game.settlingRoundId === roundId) game.settlingRoundId = null;
   }
 
   function showCashoutPending() {
@@ -994,6 +1103,9 @@
       });
       await finishFromServerResult(response, roundId);
     } catch (error) {
+      // The WebSocket can confirm settlement before a slower HTTP cash-out times out.
+      // Do not overwrite that result or reopen recovery UI after the round is already done.
+      if (game.lastSettledRoundId === roundId || !game.active || game.activeRound?.id !== roundId) return;
       game.cashoutPending = false;
       if (error.status === 409) {
         try {
@@ -1376,9 +1488,13 @@
     if (document.hidden) {
       releaseAnyHold();
       stopStatusPolling();
-    } else if (game.active && game.activeRound) {
-      // One immediate reconciliation on return; normal one-second polling resumes afterward.
-      void pollRoundStatus().finally(() => { if (game.active) scheduleStatusPoll(); });
+    } else {
+      connectRoundEvents();
+      if (game.active && game.activeRound) {
+        // Reconcile immediately after backgrounding; WebSocket terminal events provide the
+        // low-latency path, while status polling remains the resilience fallback.
+        void pollRoundStatus().finally(() => { if (game.active) scheduleStatusPoll(); });
+      }
     }
   });
 
