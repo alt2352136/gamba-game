@@ -29,7 +29,6 @@
     multiplierCaption: document.getElementById("multiplier-caption"),
     meterTrack: document.getElementById("meter-track"),
     meterFill: document.getElementById("meter-fill"),
-    meterWobble: document.getElementById("meter-wobble"),
     roundStatus: document.getElementById("round-status"),
     roundMessage: document.getElementById("round-message"),
     holdButton: document.getElementById("hold-button"),
@@ -47,6 +46,8 @@
     statPayout: document.getElementById("stat-total-payout"),
     leaderboardList: document.getElementById("leaderboard-list"),
     bankruptModal: document.getElementById("bankrupt-modal"),
+    bankruptKicker: document.getElementById("bankrupt-kicker"),
+    bankruptTitle: document.getElementById("bankrupt-title"),
     bankruptCopy: document.getElementById("bankrupt-copy"),
     acceptDefeatButton: document.getElementById("accept-defeat-button"),
     bankLoanButton: document.getElementById("bank-loan-button"),
@@ -71,6 +72,12 @@
     verifyFairnessButton: document.getElementById("verify-fairness-button"),
     verifyFairnessStatus: document.getElementById("verify-fairness-status")
   };
+  const loanOptionButtons = [...document.querySelectorAll(".loan-option")];
+  const quickBetButtons = [...document.querySelectorAll(".quick-bets button")];
+  const loanStatusElements = Object.fromEntries(Object.keys(LOANS).map((key) => [key, {
+    status: document.getElementById(`loan-${key}-state`),
+    details: document.querySelector(`[data-loan-status="${key}"] .loan-availability-main small`)
+  }]));
 
   const game = {
     ready: false,
@@ -378,7 +385,7 @@
 
   function updateLoanOptions() {
     const canBorrow = game.ready && game.waitingForLoan && game.balance <= 0 && !game.gameOver && !game.active;
-    document.querySelectorAll(".loan-option").forEach((button) => {
+    loanOptionButtons.forEach((button) => {
       const principal = Number(button.dataset.loan);
       const loan = LOANS[principal];
       const taken = Boolean(game.loansTaken[principal]);
@@ -393,11 +400,10 @@
     Object.keys(LOANS).forEach((key) => {
       const principal = Number(key);
       const loan = LOANS[principal];
-      const status = document.getElementById(`loan-${principal}-state`);
+      const { status, details } = loanStatusElements[key];
       const activeLoan = game.activeLoans.find((item) => item.principal === principal);
       const taken = Boolean(game.loansTaken[principal]);
       const repaid = Boolean(game.loansRepaid[principal]);
-      const details = document.querySelector(`[data-loan-status="${principal}"] .loan-availability-main small`);
       status.textContent = activeLoan ? "ACTIVE" : repaid ? "REPAID" : taken ? "USED" : "AVAILABLE";
       status.classList.toggle("is-active", Boolean(activeLoan));
       status.classList.toggle("is-used", taken && !activeLoan && !repaid);
@@ -420,16 +426,6 @@
     const progress = ((game.multiplier - 1) / (MAX_MULTIPLIER - 1)) * 100;
     const clamped = Math.max(0, Math.min(100, progress));
     elements.meterFill.style.width = `${clamped}%`;
-    // Keep the endpoint marker locked to the actual fill edge. A cosmetic wobble
-    // makes the progress line appear to detach from its marker.
-    const trackWidth = elements.meterTrack.clientWidth;
-    const markerRadius = 3.5;
-    const endpoint = trackWidth * clamped / 100;
-    const markerX = trackWidth > markerRadius * 2
-      ? Math.max(markerRadius, Math.min(trackWidth - markerRadius, endpoint))
-      : endpoint;
-    elements.meterWobble.style.left = `${markerX}px`;
-    elements.meterTrack.classList.toggle("is-running", game.active);
     elements.meterTrack.classList.toggle("busted", elements.multiplier.classList.contains("busted"));
   }
 
@@ -452,11 +448,11 @@
     elements.holdButton.disabled = !game.ready || game.initializing || game.recoveredRound || (!game.active && (game.gameOver || game.waitingForLoan || game.balance <= 0));
     elements.betInput.disabled = !canPlay || game.active;
     elements.maxButton.disabled = !canPlay || game.active;
-    document.querySelectorAll(".quick-bets button").forEach((button) => { button.disabled = !canPlay || game.active; });
+    quickBetButtons.forEach((button) => { button.disabled = !canPlay || game.active; });
     updateLoanOptions();
   }
 
-  function applyState(state, profile = null) {
+  function applyState(state, profile = null, { updateModals = true } = {}) {
     if (!state) throw new Error("Backend returned no game state.");
     game.state = state;
     game.balance = Number(state.balance);
@@ -472,6 +468,7 @@
     renderHistory(game.history);
     updateUI();
 
+    if (!updateModals) return;
     if (game.gameOver && !game.active) {
       showGameOver("GAME OVER", "This game has ended. Start a new game to begin another seed batch.", "Game over", false);
     } else if (game.waitingForLoan && game.balance <= 0 && !game.active) {
@@ -612,7 +609,6 @@
     }
     game.multiplier = Math.min(MAX_MULTIPLIER, Math.max(1, Number(item.multiplier) || 1));
     elements.multiplier.classList.remove("live");
-    elements.meterTrack.classList.remove("is-running");
     updateMultiplierDisplay();
     if (item.result === "BUSTED") {
       elements.multiplier.classList.add("busted");
@@ -723,7 +719,7 @@
       game.active = true;
       game.recoveredRound = false;
       game.multiplier = 1;
-          game.lastSettledRoundId = null;
+      game.lastSettledRoundId = null;
       elements.multiplier.classList.add("live");
       elements.multiplier.classList.remove("busted");
       elements.meterTrack.classList.remove("busted");
@@ -800,7 +796,6 @@
     game.activeRound = null;
     game.activeBet = 0;
     elements.multiplier.classList.remove("live");
-    elements.meterTrack.classList.remove("is-running");
 
     applyState(response.state, response.profile);
     const isBust = result === "busted" || result === "BUSTED";
@@ -915,12 +910,22 @@
     if (focusable) focusable.focus();
   }
 
+  function resetBankruptcyModal() {
+    elements.bankruptKicker.textContent = "BALANCE: 0 GOLD";
+    elements.bankruptTitle.textContent = "No gold left";
+    elements.acceptDefeatButton.textContent = "Accept defeat";
+    elements.bankLoanButton.hidden = false;
+    elements.bankLoanButton.disabled = false;
+  }
+
   function showBankruptcyPrompt() {
     if (game.balance > 0 || !game.waitingForLoan || game.gameOver) return;
+    resetBankruptcyModal();
     const allTaken = Object.values(game.loansTaken).every(Boolean);
     const overdue = game.activeLoans.filter((loan) => loan.roundsLeft <= 0);
     if (allTaken) {
-      elements.bankruptCopy.textContent = "Your balance is 0 gold and all three loans have been used. There is no gold left to continue.";
+      elements.bankruptCopy.textContent = "You've used all three loans. Accept defeat to finish this game.";
+      elements.bankLoanButton.hidden = true;
     } else if (overdue.length) {
       const due = overdue.reduce((sum, loan) => sum + loan.repayment, 0);
       elements.bankruptCopy.textContent = `Your balance is 0 gold. You can take another available loan, but ${formatGold(due)} gold in overdue repayments must be settled immediately.`;
@@ -932,6 +937,20 @@
     elements.bankruptModal.classList.remove("hidden");
     updateUI();
     focusFirst(elements.bankruptModal);
+  }
+
+  function showExhaustedLoansEndState() {
+    // Reuse the current dialog: ending a game with no loans left should not open a second modal.
+    elements.bankruptKicker.textContent = "GAME OVER";
+    elements.bankruptTitle.textContent = "All loans used";
+    elements.bankruptCopy.textContent = "You used all three loans and lost the remaining balance.";
+    elements.acceptDefeatButton.textContent = "Start new game";
+    elements.bankLoanButton.hidden = true;
+    elements.bankruptModal.classList.remove("hidden");
+    elements.gameoverModal.classList.add("hidden");
+    elements.loanModal.classList.add("hidden");
+    updateUI();
+    elements.acceptDefeatButton.focus();
   }
 
   function showGameOver(eyebrow, copy, title = "Game over", focus = true) {
@@ -952,9 +971,21 @@
     elements.acceptDefeatButton.disabled = true;
     try {
       const response = await api("/api/game/end", { method: "POST", body: {}, idempotencyKey: newIdempotencyKey() });
-      elements.bankruptModal.classList.add("hidden");
-      applyState(response.state, response.profile);
-      showGameOver("BALANCE DEPLETED", "Your balance reached 0 gold and you chose not to borrow again.", "No gold left");
+      const allLoansUsed = Object.values(response.state?.loansTaken || game.loansTaken).every(Boolean);
+      if (allLoansUsed) {
+        applyState(response.state, response.profile, { updateModals: false });
+        elements.bankruptModal.classList.add("hidden");
+        elements.loanModal.classList.add("hidden");
+        elements.gameoverModal.classList.add("hidden");
+        setMessage("All three loans were used. Starting a new game…", "success");
+        await startNewGame();
+        // If the reset request fails, reuse the same dialog as a retry path instead of opening a second one.
+        if (game.gameOver) showExhaustedLoansEndState();
+      } else {
+        elements.bankruptModal.classList.add("hidden");
+        applyState(response.state, response.profile);
+        showGameOver("BALANCE DEPLETED", "Your balance reached 0 gold and you chose not to borrow again.", "No gold left");
+      }
     } catch (error) {
       setMessage(error.message || "Couldn't end this game on the server.", "danger");
     } finally {
@@ -1033,9 +1064,10 @@
       elements.gameoverModal.classList.add("hidden");
       elements.bankruptModal.classList.add("hidden");
       elements.loanModal.classList.add("hidden");
+      resetBankruptcyModal();
       elements.betInput.value = "88";
       elements.multiplier.classList.remove("busted", "live");
-      elements.meterTrack.classList.remove("busted", "is-running");
+      elements.meterTrack.classList.remove("busted");
       game.multiplier = 1;
       updateMultiplierDisplay();
       elements.multiplierCaption.textContent = "Hold to start. Release to cash out.";
@@ -1171,7 +1203,7 @@
     elements.betInput.dispatchEvent(new Event("input"));
   });
 
-  document.querySelectorAll(".quick-bets button").forEach((button) => {
+  quickBetButtons.forEach((button) => {
     button.addEventListener("click", () => {
       const fraction = Number(button.dataset.fraction);
       const amount = Math.max(1, Math.floor(game.balance * fraction));
@@ -1214,10 +1246,13 @@
     }
   });
 
-  elements.acceptDefeatButton.addEventListener("click", () => void acceptDefeat());
+  elements.acceptDefeatButton.addEventListener("click", () => {
+    if (game.gameOver) void startNewGame();
+    else void acceptDefeat();
+  });
   elements.bankLoanButton.addEventListener("click", openLoanModal);
   elements.loanCloseButton.addEventListener("click", closeLoanModal);
-  document.querySelectorAll(".loan-option").forEach((button) => {
+  loanOptionButtons.forEach((button) => {
     button.addEventListener("click", () => void takeLoan(Number(button.dataset.loan)));
   });
   elements.newGameButton.addEventListener("click", () => void startNewGame());
@@ -1265,6 +1300,10 @@
       [160, 146, 199], // dim lilac
       [86, 76, 135]    // deep violet
     ];
+    const fillStyles = palette.map(([r, g, b]) => Array.from(
+      { length: 37 },
+      (_, alpha) => `rgba(${r},${g},${b},${(alpha / 100).toFixed(2)})`
+    ));
     let particles = [];
     let width = 0;
     let height = 0;
@@ -1273,18 +1312,19 @@
     let previousTime = 0;
     let elapsed = 0;
     let stopped = false;
+    let inViewport = true;
 
     function chooseColor(x, y) {
       // A low-frequency color drift mixes warm and cool tones across the full formation.
       // No single coordinate becomes a bright red island or a planet-like center.
       const wave = 0.5 + 0.5 * Math.sin((x / width) * Math.PI * 2.1 + Math.sin((y / height) * Math.PI * 1.6) * 0.8);
       const roll = random();
-      if (roll < 0.10 + wave * 0.07) return palette[3];
-      if (roll < 0.28 + wave * 0.07) return palette[2];
-      if (roll < 0.52) return palette[1];
-      if (roll < 0.80) return palette[0];
-      if (roll < 0.94) return palette[5];
-      return palette[4];
+      if (roll < 0.10 + wave * 0.07) return 3;
+      if (roll < 0.28 + wave * 0.07) return 2;
+      if (roll < 0.52) return 1;
+      if (roll < 0.80) return 0;
+      if (roll < 0.94) return 5;
+      return 4;
     }
 
     function sampleCloudX() {
@@ -1304,7 +1344,7 @@
     function buildParticles() {
       particles = [];
       // A restrained field of fine dust; density makes cloud shapes, not bright particles or blur.
-      const count = Math.max(4200, Math.min(10500, Math.round(width * height / 24)));
+      const count = Math.max(3200, Math.min(7200, Math.round(width * height / 34)));
       const centerY = height * 0.49;
 
       for (let i = 0; i < count; i += 1) {
@@ -1358,10 +1398,8 @@
           x, y,
           phase: random() * Math.PI * 2,
           size,
-          length: 0.7 + Math.pow(random(), 1.8) * 1.8,
           alpha,
           color,
-          sparkle,
           kind
         });
       }
@@ -1369,18 +1407,22 @@
 
     function resize() {
       const rect = canvas.getBoundingClientRect();
-      width = Math.max(1, rect.width);
-      height = Math.max(1, rect.height);
-      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      const nextWidth = Math.max(1, rect.width);
+      const nextHeight = Math.max(1, rect.height);
+      const nextDpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      if (Math.abs(nextWidth - width) < 1 && Math.abs(nextHeight - height) < 1 && nextDpr === dpr) return;
+      width = nextWidth;
+      height = nextHeight;
+      dpr = nextDpr;
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
       buildParticles();
-      draw(0);
+      if (inViewport && !document.hidden && !stopped) draw(0);
     }
 
     function draw(time) {
-      if (stopped) return;
+      if (stopped || document.hidden || !inViewport) return;
       if (!reduceMotion.matches && time - previousTime < 30) {
         frame = window.requestAnimationFrame(draw);
         return;
@@ -1416,16 +1458,10 @@
         const centerQuiet = 1 - 0.64 * Math.exp(-((nx * nx) + (ny * ny)) * 1.05);
         const shimmer = 0.94 + Math.sin(elapsed * 0.19 + particle.phase) * 0.06;
         const alpha = Math.min(0.31, particle.alpha * centerQuiet * shimmer);
-        const [r, g, b] = particle.color;
-
-        if (particle.sparkle) {
-          // Only an occasional tiny hard glint; avoid bright dots that read as planets.
-          context.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
-          context.fillRect(x, y, particle.size, particle.size);
-        } else {
-          context.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
-          context.fillRect(x, y, particle.size, particle.size);
-        }
+        // Quantized, precomputed fill styles avoid allocating thousands of color strings per frame.
+        const alphaStep = Math.min(36, Math.max(0, Math.round(alpha * 100)));
+        context.fillStyle = fillStyles[particle.color][alphaStep];
+        context.fillRect(x, y, particle.size, particle.size);
       }
 
       if (!reduceMotion.matches) frame = window.requestAnimationFrame(draw);
@@ -1433,22 +1469,37 @@
 
     function restartMotion() {
       if (frame) window.cancelAnimationFrame(frame);
+      frame = 0;
       previousTime = 0;
-      frame = window.requestAnimationFrame(draw);
+      if (!stopped && !document.hidden && inViewport) {
+        if (reduceMotion.matches) draw(0);
+        else frame = window.requestAnimationFrame(draw);
+      }
     }
 
     const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
     if (resizeObserver) resizeObserver.observe(canvas.parentElement);
-    window.addEventListener("resize", resize, { passive: true });
+    else window.addEventListener("resize", resize, { passive: true });
+
+    const intersectionObserver = typeof IntersectionObserver === "function"
+      ? new IntersectionObserver(([entry]) => {
+        inViewport = entry.isIntersecting;
+        if (inViewport) restartMotion();
+        else if (frame) {
+          window.cancelAnimationFrame(frame);
+          frame = 0;
+        }
+      })
+      : null;
+    if (intersectionObserver) intersectionObserver.observe(canvas.parentElement || canvas);
+
     reduceMotion.addEventListener?.("change", restartMotion);
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) {
-        stopped = true;
-        if (frame) window.cancelAnimationFrame(frame);
-      } else {
-        stopped = false;
-        restartMotion();
-      }
+      stopped = document.hidden;
+      if (stopped && frame) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+      } else restartMotion();
     });
     resize();
   }
