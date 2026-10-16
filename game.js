@@ -1344,7 +1344,7 @@
     function buildParticles() {
       particles = [];
       // A restrained field of fine dust; density makes cloud shapes, not bright particles or blur.
-      const count = Math.max(3200, Math.min(7200, Math.round(width * height / 34)));
+      const count = Math.max(1800, Math.min(3600, Math.round(width * height / 58)));
       const centerY = height * 0.49;
 
       for (let i = 0; i < count; i += 1) {
@@ -1423,7 +1423,7 @@
 
     function draw(time) {
       if (stopped || document.hidden || !inViewport) return;
-      if (!reduceMotion.matches && time - previousTime < 30) {
+      if (!reduceMotion.matches && time - previousTime < 40) {
         frame = window.requestAnimationFrame(draw);
         return;
       }
