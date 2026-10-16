@@ -319,11 +319,7 @@ main { padding: 26px 0 28px; }
 .hold-button:focus-visible { outline: 3px solid #ffffff; outline-offset: 4px; }
 .hold-button:disabled { cursor: not-allowed; opacity: 0.48; filter: saturate(0.45); transform: none; box-shadow: none; }
 .hold-button:disabled::after { display: none; }
-.hold-button-title, .hold-button-subtitle { position: relative; z-index: 2; text-shadow: 0 1px 4px rgba(30, 5, 52, 0.4); }
-.hold-button-title { font-size: 16px; font-weight: 820; letter-spacing: 0.065em; }
-.hold-button-subtitle { font-size: 13px; font-weight: 550; opacity: 0.95; letter-spacing: 0.01em; }
-.hold-hint { margin: 10px 0 0; color: var(--muted); text-align: center; font-size: 11px; font-weight: 650; letter-spacing: 0.065em; }
-.hold-hint span { padding: 0 4px; color: var(--accent); }
+.hold-button-title { position: relative; z-index: 2; text-shadow: 0 1px 4px rgba(30, 5, 52, 0.4); font-size: 16px; font-weight: 820; letter-spacing: 0.065em; }
 .game-panel-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .game-panel-footer strong { color: var(--text); font-weight: 700; }
 
@@ -446,6 +442,8 @@ main { padding: 26px 0 28px; }
 .modal-card h2 { margin: 0; color: var(--text); font-size: 26px; font-weight: 650; letter-spacing: -0.04em; }
 .modal-copy { margin: 10px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
 .modal-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 22px; }
+.modal-actions.single-action { grid-template-columns: 1fr; justify-items: center; }
+.modal-actions.single-action #accept-defeat-button { width: min(100%, 220px); }
 .button-primary, .button-secondary { min-height: 44px; padding: 10px 14px; border: 1px solid transparent; border-radius: 7px; font-size: 13px; font-weight: 700; cursor: pointer; }
 .button-primary { color: #211a32; border-color: rgba(231, 224, 255, 0.8); background: #eee9ff; box-shadow: inset 3px 0 0 var(--accent); }
 .button-primary:hover:not(:disabled) { background: #ffffff; }

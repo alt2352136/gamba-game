@@ -33,7 +33,6 @@
     roundMessage: document.getElementById("round-message"),
     holdButton: document.getElementById("hold-button"),
     holdButtonTitle: document.getElementById("hold-button-title"),
-    holdButtonSubtitle: document.getElementById("hold-button-subtitle"),
     loanStatus: document.getElementById("loan-status"),
     loanDescription: document.getElementById("loan-description"),
     loanRounds: document.getElementById("loan-rounds"),
@@ -49,6 +48,7 @@
     bankruptKicker: document.getElementById("bankrupt-kicker"),
     bankruptTitle: document.getElementById("bankrupt-title"),
     bankruptCopy: document.getElementById("bankrupt-copy"),
+    bankruptActions: document.getElementById("bankrupt-actions"),
     acceptDefeatButton: document.getElementById("accept-defeat-button"),
     bankLoanButton: document.getElementById("bank-loan-button"),
     loanModal: document.getElementById("loan-modal"),
@@ -333,6 +333,10 @@
     renderProfile();
   }
 
+  function hasUsedAllLoans(flags = game.loansTaken) {
+    return Object.keys(LOANS).every((principal) => Boolean(flags?.[principal]));
+  }
+
   function getRepaidFlags(state) {
     const flags = { 444: false, 888: false, 1500: false, ...(state?.loansRepaid || {}) };
     for (const item of state?.history || []) {
@@ -413,7 +417,7 @@
       else details.textContent = `Repay ${formatGold(loan.repayment)} · ${loan.rounds}-round deadline`;
     });
 
-    const allTaken = Object.values(game.loansTaken).every(Boolean);
+    const allTaken = hasUsedAllLoans();
     if (allTaken) elements.loanWarning.textContent = "All three loans have been used in this game.";
     else if (game.activeLoans.length) elements.loanWarning.textContent = "Taking another loan extends existing deadlines according to the displayed rules.";
     else elements.loanWarning.textContent = "Larger loans have higher fees and shorter deadlines.";
@@ -582,8 +586,7 @@
     elements.multiplier.classList.add("live");
     elements.multiplier.classList.remove("busted");
     elements.meterTrack.classList.remove("busted");
-    elements.holdButtonTitle.textContent = recovered ? "ROUND RECOVERED" : "ROUND IN PROGRESS";
-    elements.holdButtonSubtitle.textContent = recovered ? "Server will settle automatically" : "Release to cash out";
+    elements.holdButtonTitle.textContent = recovered ? "ROUND RECOVERED" : "RELEASE TO CASH OUT";
     elements.multiplierCaption.textContent = recovered
       ? "This round was interrupted. Its committed result will settle automatically; cash-out is disabled after recovery."
       : "Release to cash out at the current multiplier.";
@@ -604,7 +607,7 @@
   function showRecoveredLastResult(state) {
     const item = Array.isArray(state?.history) ? state.history.at(-1) : null;
     if (!item) {
-      setMessage("Connected to the game server. Place a bet, then hold to start.");
+      setMessage("Connected to the game server. Ready to play.");
       return;
     }
     game.multiplier = Math.min(MAX_MULTIPLIER, Math.max(1, Number(item.multiplier) || 1));
@@ -615,7 +618,6 @@
       elements.meterTrack.classList.add("busted");
       elements.multiplierCaption.textContent = `Last round crashed at x${game.multiplier.toFixed(2)}.`;
       elements.holdButtonTitle.textContent = "BUST";
-      elements.holdButtonSubtitle.textContent = "Last round settled by server";
       setRoundStatus("BUST", "busted");
       setMessage(`Recovered session: round ${item.round} crashed at x${game.multiplier.toFixed(2)}. Lost ${formatGold(item.stake)} gold.`, "danger");
     } else {
@@ -623,7 +625,6 @@
       elements.meterTrack.classList.remove("busted");
       elements.multiplierCaption.textContent = `Last cash-out at x${game.multiplier.toFixed(2)}.`;
       elements.holdButtonTitle.textContent = "HOLD TO START";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
       setRoundStatus("LAST ROUND SETTLED");
       const net = Number(item.net) || 0;
       setMessage(`Recovered session: last round paid ${formatGold(item.payout)} gold · net ${net >= 0 ? "+" : "−"}${formatGold(Math.abs(net))}.`, "success");
@@ -670,7 +671,7 @@
     await ensureClientSeed();
     if (game.state) game.state.clientSeed = game.clientSeed;
     game.ready = true;
-    setMessage("Connected securely. Place a bet, then hold to start.", "success");
+    setMessage("Connected securely. Ready to play.", "success");
     updateUI();
     renderFairness();
   }
@@ -702,7 +703,6 @@
     game.activePointerId = source === "pointer" ? identifier : null;
     game.keyboardCode = source === "keyboard" ? identifier : null;
     elements.holdButtonTitle.textContent = "STARTING ROUND…";
-    elements.holdButtonSubtitle.textContent = "Placing your bet";
     elements.holdButton.classList.add("is-holding");
     elements.holdButton.setAttribute("aria-pressed", "true");
     setMessage("Starting your round…");
@@ -725,8 +725,7 @@
       elements.meterTrack.classList.remove("busted");
       elements.holdButton.classList.add("is-holding");
       elements.holdButton.setAttribute("aria-pressed", "true");
-      elements.holdButtonTitle.textContent = "ROUND IN PROGRESS";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
+      elements.holdButtonTitle.textContent = "RELEASE TO CASH OUT";
       elements.multiplierCaption.textContent = "Release to cash out at the current multiplier.";
       setRoundStatus("RUNNING", "live");
       setMessage(`Bet placed: ${formatGold(stake)} gold.`, "success");
@@ -757,15 +756,13 @@
             elements.holdButton.disabled = false;
             elements.holdButton.classList.add("is-holding");
             elements.holdButton.setAttribute("aria-pressed", "true");
-            elements.holdButtonTitle.textContent = "ROUND IN PROGRESS";
-            elements.holdButtonSubtitle.textContent = "Release to cash out";
+            elements.holdButtonTitle.textContent = "RELEASE TO CASH OUT";
             updateUI();
           }
           return;
         }
       } catch { /* preserve the original request error below */ }
       elements.holdButtonTitle.textContent = "HOLD TO START";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
       setRoundStatus("READY");
       setMessage(error.message || "The server could not start the round.", "danger");
       updateUI();
@@ -797,7 +794,7 @@
     game.activeBet = 0;
     elements.multiplier.classList.remove("live");
 
-    applyState(response.state, response.profile);
+    applyState(response.state, response.profile, { updateModals: false });
     const isBust = result === "busted" || result === "BUSTED";
     const multiplier = isBust
       ? (Number.isFinite(Number(crashPoint)) ? Number(crashPoint) : Math.max(1, Number(historyItem?.multiplier) || 1))
@@ -810,7 +807,6 @@
       elements.meterTrack.classList.add("busted");
       elements.multiplierCaption.textContent = `Crashed at x${game.multiplier.toFixed(2)}.`;
       elements.holdButtonTitle.textContent = "BUST";
-      elements.holdButtonSubtitle.textContent = "The stake was lost";
       setRoundStatus("BUST", "busted");
       setMessage(`Crashed at x${game.multiplier.toFixed(2)}. You lost ${formatGold(historyItem?.stake ?? response.state?.history?.at(-1)?.stake ?? 0)} gold.`, "danger");
     } else {
@@ -818,7 +814,6 @@
       elements.meterTrack.classList.remove("busted");
       elements.multiplierCaption.textContent = `Cashed out at x${game.multiplier.toFixed(2)}.`;
       elements.holdButtonTitle.textContent = "HOLD TO START";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
       setRoundStatus("CASHED OUT");
       const payout = Number(response.payout ?? historyItem?.payout ?? 0);
       const net = Number(response.net ?? historyItem?.net ?? 0);
@@ -829,6 +824,9 @@
       showGameOver("LOAN DEFAULT", "An overdue loan could not be repaid. This game has ended.", "Loan not repaid");
     } else if (response.state.waitingForLoan && response.state.balance <= 0) {
       showBankruptcyPrompt();
+    } else {
+      elements.bankruptModal.classList.add("hidden");
+      elements.loanModal.classList.add("hidden");
     }
     updateUI();
   }
@@ -838,7 +836,6 @@
     stopAnimation();
     stopStatusPolling();
     elements.holdButtonTitle.textContent = "CASHING OUT…";
-    elements.holdButtonSubtitle.textContent = "Confirming payout";
     elements.holdButton.classList.remove("is-holding");
     elements.holdButton.setAttribute("aria-pressed", "false");
     setRoundStatus("CASHING OUT");
@@ -875,7 +872,6 @@
         } catch { /* show the original message below */ }
       }
       elements.holdButtonTitle.textContent = "CHECKING RESULT";
-      elements.holdButtonSubtitle.textContent = "Waiting for server confirmation";
       setRoundStatus("CHECKING");
       setMessage(`Cash-out wasn't confirmed yet. Checking the round state. ${error.message}`, "danger");
       await pollRoundStatus();
@@ -916,16 +912,18 @@
     elements.acceptDefeatButton.textContent = "Accept defeat";
     elements.bankLoanButton.hidden = false;
     elements.bankLoanButton.disabled = false;
+    elements.bankruptActions.classList.remove("single-action");
   }
 
   function showBankruptcyPrompt() {
     if (game.balance > 0 || !game.waitingForLoan || game.gameOver) return;
     resetBankruptcyModal();
-    const allTaken = Object.values(game.loansTaken).every(Boolean);
+    const allTaken = hasUsedAllLoans();
     const overdue = game.activeLoans.filter((loan) => loan.roundsLeft <= 0);
     if (allTaken) {
       elements.bankruptCopy.textContent = "You've used all three loans. Accept defeat to finish this game.";
       elements.bankLoanButton.hidden = true;
+      elements.bankruptActions.classList.add("single-action");
     } else if (overdue.length) {
       const due = overdue.reduce((sum, loan) => sum + loan.repayment, 0);
       elements.bankruptCopy.textContent = `Your balance is 0 gold. You can take another available loan, but ${formatGold(due)} gold in overdue repayments must be settled immediately.`;
@@ -946,6 +944,7 @@
     elements.bankruptCopy.textContent = "You used all three loans and lost the remaining balance.";
     elements.acceptDefeatButton.textContent = "Start new game";
     elements.bankLoanButton.hidden = true;
+    elements.bankruptActions.classList.add("single-action");
     elements.bankruptModal.classList.remove("hidden");
     elements.gameoverModal.classList.add("hidden");
     elements.loanModal.classList.add("hidden");
@@ -971,7 +970,10 @@
     elements.acceptDefeatButton.disabled = true;
     try {
       const response = await api("/api/game/end", { method: "POST", body: {}, idempotencyKey: newIdempotencyKey() });
-      const allLoansUsed = Object.values(response.state?.loansTaken || game.loansTaken).every(Boolean);
+      // Merge known flags with the response so a partial payload cannot make an empty object
+      // accidentally satisfy Array.every() and skip the remaining loan decision.
+      const responseLoanFlags = { ...game.loansTaken, ...(response.state?.loansTaken || {}) };
+      const allLoansUsed = hasUsedAllLoans(responseLoanFlags);
       if (allLoansUsed) {
         applyState(response.state, response.profile, { updateModals: false });
         elements.bankruptModal.classList.add("hidden");
@@ -996,7 +998,7 @@
 
   function openLoanModal() {
     if (game.balance > 0 || !game.waitingForLoan || game.gameOver || game.active) return;
-    if (Object.values(game.loansTaken).every(Boolean)) return;
+    if (hasUsedAllLoans()) return;
     updateLoanOptions();
     elements.bankruptModal.classList.add("hidden");
     elements.loanModal.classList.remove("hidden");
@@ -1035,7 +1037,6 @@
       elements.meterTrack.classList.remove("busted");
       elements.multiplierCaption.textContent = "Place a bet to start the next round.";
       elements.holdButtonTitle.textContent = "HOLD TO START";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
       setRoundStatus("LOAN TAKEN");
       elements.holdButton.focus();
     } catch (error) {
@@ -1072,7 +1073,6 @@
       updateMultiplierDisplay();
       elements.multiplierCaption.textContent = "Hold to start. Release to cash out.";
       elements.holdButtonTitle.textContent = "HOLD TO START";
-      elements.holdButtonSubtitle.textContent = "Release to cash out";
       setRoundStatus("READY");
       setMessage(`New seed batch started. Batch ${reset.revealed.epoch} is now available to verify.`, "success");
       updateUI();
@@ -1388,13 +1388,14 @@
         else if (kind === "upper-dust" || kind === "lower-dust") alpha = 0.07 + Math.pow(random(), 1.9) * 0.16;
         else alpha = 0.025 + random() * 0.07;
 
+        const phase = random() * Math.PI * 2;
+        // Bake the tiny initial offset into the point; no phase or kind metadata is needed later.
         particles.push({
-          x, y,
-          phase: random() * Math.PI * 2,
+          x: x + Math.sin(phase) * 0.42,
+          y: y + Math.cos(phase) * 0.48,
           size,
           alpha,
-          color,
-          kind
+          color
         });
       }
     }
@@ -1403,9 +1404,7 @@
       context.clearRect(0, 0, width, height);
 
       for (const particle of particles) {
-        // Preserve the tiny positional variation from the previous animation's first frame.
-        const x = particle.x + Math.sin(particle.phase) * 0.42;
-        const y = particle.y + Math.cos(particle.phase) * 0.48;
+        const { x, y } = particle;
         if (x < -5 || x > width + 5 || y < -5 || y > height + 5) continue;
 
         // Keep the readout area quieter without hiding the moving CSS star trails.
@@ -1417,6 +1416,8 @@
         context.fillStyle = fillStyles[particle.color][alphaStep];
         context.fillRect(x, y, particle.size, particle.size);
       }
+      // The canvas retains the painted pixels, so release the temporary particle objects.
+      particles = [];
     }
 
     function resize() {
