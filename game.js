@@ -1276,7 +1276,6 @@
     const context = canvas.getContext("2d", { alpha: true, desynchronized: true });
     if (!context) return;
 
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const random = (() => {
       // A stable seed keeps the particle composition art-directed between visits.
       let seed = 0x67a11a;
@@ -1308,11 +1307,6 @@
     let width = 0;
     let height = 0;
     let dpr = 1;
-    let frame = 0;
-    let previousTime = 0;
-    let elapsed = 0;
-    let stopped = false;
-    let inViewport = true;
 
     function chooseColor(x, y) {
       // A low-frequency color drift mixes warm and cool tones across the full formation.
@@ -1405,8 +1399,29 @@
       }
     }
 
+    function drawStaticField() {
+      context.clearRect(0, 0, width, height);
+
+      for (const particle of particles) {
+        // Preserve the tiny positional variation from the previous animation's first frame.
+        const x = particle.x + Math.sin(particle.phase) * 0.42;
+        const y = particle.y + Math.cos(particle.phase) * 0.48;
+        if (x < -5 || x > width + 5 || y < -5 || y > height + 5) continue;
+
+        // Keep the readout area quieter without hiding the moving CSS star trails.
+        const nx = (x - width * 0.5) / (width * 0.26);
+        const ny = (y - height * 0.44) / (height * 0.30);
+        const centerQuiet = 1 - 0.64 * Math.exp(-((nx * nx) + (ny * ny)) * 1.05);
+        const alpha = Math.min(0.31, particle.alpha * centerQuiet);
+        const alphaStep = Math.min(36, Math.max(0, Math.round(alpha * 100)));
+        context.fillStyle = fillStyles[particle.color][alphaStep];
+        context.fillRect(x, y, particle.size, particle.size);
+      }
+    }
+
     function resize() {
-      const rect = canvas.getBoundingClientRect();
+      // Read the untransformed parent box: the canvas itself has a subtle CSS drift animation.
+      const rect = (canvas.parentElement || canvas).getBoundingClientRect();
       const nextWidth = Math.max(1, rect.width);
       const nextHeight = Math.max(1, rect.height);
       const nextDpr = Math.min(window.devicePixelRatio || 1, 1.5);
@@ -1418,89 +1433,14 @@
       canvas.height = Math.round(height * dpr);
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
       buildParticles();
-      if (inViewport && !document.hidden && !stopped) draw(0);
+      drawStaticField();
     }
 
-    function draw(time) {
-      if (stopped || document.hidden || !inViewport) return;
-      if (!reduceMotion.matches && time - previousTime < 40) {
-        frame = window.requestAnimationFrame(draw);
-        return;
-      }
-      const delta = previousTime ? Math.min((time - previousTime) / 1000, 0.05) : 0;
-      previousTime = time;
-      if (!reduceMotion.matches) elapsed += delta;
-      context.clearRect(0, 0, width, height);
-
-      for (const particle of particles) {
-        // Slow, nearly imperceptible lateral drift avoids orbiting centers and planet-like rings.
-        // The field gently changes direction by height, like dust carried through a broad current.
-        const band = particle.kind === "upper-dust" ? -0.20 : particle.kind === "lower-dust" ? 0.16 : 0.045;
-        const phase = particle.phase + (particle.x / width) * Math.PI * 1.5;
-        const vx = band + Math.sin((particle.y / height) * Math.PI * 2 + particle.phase) * 0.15;
-        const vy = Math.sin(phase) * 0.095 + Math.cos((particle.y / height) * Math.PI * 2.5) * 0.045;
-        if (!reduceMotion.matches && delta > 0) {
-          particle.x += vx * delta;
-          particle.y += vy * delta;
-          if (particle.x < -5) particle.x = width + 4;
-          else if (particle.x > width + 5) particle.x = -4;
-          if (particle.y < -5) particle.y = height + 4;
-          else if (particle.y > height + 5) particle.y = -4;
-        }
-
-        const x = particle.x + Math.sin(elapsed * 0.13 + particle.phase) * 0.42;
-        const y = particle.y + Math.cos(elapsed * 0.11 + particle.phase) * 0.48;
-        if (x < -5 || x > width + 5 || y < -5 || y > height + 5) continue;
-
-        // Fade particles more strongly behind the central readout; motion stars sit on a higher layer.
-        const nx = (x - width * 0.5) / (width * 0.26);
-        const ny = (y - height * 0.44) / (height * 0.30);
-        const centerQuiet = 1 - 0.64 * Math.exp(-((nx * nx) + (ny * ny)) * 1.05);
-        const shimmer = 0.94 + Math.sin(elapsed * 0.19 + particle.phase) * 0.06;
-        const alpha = Math.min(0.31, particle.alpha * centerQuiet * shimmer);
-        // Quantized, precomputed fill styles avoid allocating thousands of color strings per frame.
-        const alphaStep = Math.min(36, Math.max(0, Math.round(alpha * 100)));
-        context.fillStyle = fillStyles[particle.color][alphaStep];
-        context.fillRect(x, y, particle.size, particle.size);
-      }
-
-      if (!reduceMotion.matches) frame = window.requestAnimationFrame(draw);
-    }
-
-    function restartMotion() {
-      if (frame) window.cancelAnimationFrame(frame);
-      frame = 0;
-      previousTime = 0;
-      if (!stopped && !document.hidden && inViewport) {
-        if (reduceMotion.matches) draw(0);
-        else frame = window.requestAnimationFrame(draw);
-      }
-    }
-
+    // Expensive particle placement and painting now happen only at startup or resize.
+    // CSS handles the very slight motion; no per-frame particle loop competes with input events.
     const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
     if (resizeObserver) resizeObserver.observe(canvas.parentElement);
     else window.addEventListener("resize", resize, { passive: true });
-
-    const intersectionObserver = typeof IntersectionObserver === "function"
-      ? new IntersectionObserver(([entry]) => {
-        inViewport = entry.isIntersecting;
-        if (inViewport) restartMotion();
-        else if (frame) {
-          window.cancelAnimationFrame(frame);
-          frame = 0;
-        }
-      })
-      : null;
-    if (intersectionObserver) intersectionObserver.observe(canvas.parentElement || canvas);
-
-    reduceMotion.addEventListener?.("change", restartMotion);
-    document.addEventListener("visibilitychange", () => {
-      stopped = document.hidden;
-      if (stopped && frame) {
-        window.cancelAnimationFrame(frame);
-        frame = 0;
-      } else restartMotion();
-    });
     resize();
   }
   async function boot() {

@@ -143,6 +143,16 @@ main { padding: 26px 0 28px; }
   z-index: 0;
   opacity: .74;
   pointer-events: none;
+  transform-origin: center;
+  animation: galaxy-drift 58s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes galaxy-drift {
+  from { transform: translate3d(-2px, -1px, 0) scale(1.018); }
+  to { transform: translate3d(2px, 1px, 0) scale(1.025); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .galaxy-particles { animation: none; transform: none; will-change: auto; }
 }
 .star-trail {
   position: absolute;
