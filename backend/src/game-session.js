@@ -197,9 +197,6 @@ export class GameSession {
     }
   }
 
-  webSocketClose() {}
-  webSocketError() {}
-
   broadcastRoundSettled(response, roundId, startKey = null) {
     const message = JSON.stringify({
       ...response,

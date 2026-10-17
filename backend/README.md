@@ -28,7 +28,7 @@ SEED_ENCRYPTION_KEY="$seedKey"
 Remove-Variable sessionSecret, seedKey
 ```
 
-The integration suite starts a temporary local Worker with test-only secrets and isolated storage. It never calls production. Backend unit/session tests live in `test/`; frontend module and contract tests live in `../tests/frontend/`. `npm.cmd test` runs both groups. The formula, loan, alarm and guardrail tests run as regular Node tests.
+The integration suite starts a temporary local Worker with test-only secrets and isolated storage. It never calls production. Backend unit/session tests live in `test/`; frontend module and contract tests live in `../tests/frontend/`. `npm.cmd test` runs both groups. Formula, loan, alarm, and session-invariant tests run as regular Node tests.
 
 ## Secrets
 

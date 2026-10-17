@@ -349,7 +349,7 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
       assert.ok(currentState.data.profile.leaderboard.length <= 5);
     });
 
-    await t.test("serializes simultaneous round starts so only one stake is deducted", async () => {
+    await t.test("rejects overlapping round starts and permits a start after an immediate crash", async () => {
       try {
         const before = await api(baseUrl, "/api/state", { token: auth });
         const fairnessBefore = await api(baseUrl, "/api/fairness?limit=100", { token: auth });
@@ -359,17 +359,43 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
           api(baseUrl, "/api/round/start", { method: "POST", token: auth, headers: { "idempotency-key": keyA }, body: { stake: 2 } }),
           api(baseUrl, "/api/round/start", { method: "POST", token: auth, headers: { "idempotency-key": keyB }, body: { stake: 3 } })
         ]);
-        const successes = [a, b].filter((result) => result.status === 200);
+        const successResponses = [a, b].filter((result) => result.status === 200);
         const conflicts = [a, b].filter((result) => result.status === 409);
-        assert.equal(successes.length, 1, `Expected one successful start, got ${a.status} and ${b.status}: ${a.text}; ${b.text}`);
-        assert.equal(conflicts.length, 1, `Expected one conflict, got ${a.status} and ${b.status}: ${a.text}; ${b.text}`);
-        const winner = successes[0].data;
-        assert.equal(winner.state.balance, before.data.state.balance - winner.round.stake,
-          "The winning start response must show one stake deduction.");
+        let startedRounds;
+
+        if (successResponses.length === 1 && conflicts.length === 1) {
+          // Normal case: both requests overlap while the first round is starting.
+          startedRounds = [successResponses[0].data];
+        } else if (successResponses.length === 2 && conflicts.length === 0) {
+          // A crash point of x1.00 can settle the first round before the second request
+          // reaches the session. In that case, two successful starts are valid only if
+          // the first round's settlement timestamp precedes the later round's start.
+          const ordered = successResponses.map((result) => result.data)
+            .sort((left, right) => left.round.nonce - right.round.nonce);
+          const earlier = ordered[0];
+          const later = ordered[1];
+          const earlierStatus = await api(baseUrl,
+            `/api/round/status?id=${encodeURIComponent(earlier.round.id)}`, { token: auth });
+          assert.equal(earlierStatus.status, 200, earlierStatus.text);
+          assert.equal(earlierStatus.data.result, "busted",
+            "Two starts may both succeed only if the earlier round crashed before the later start.");
+          assert.ok(Number.isFinite(earlierStatus.data.cashedOutAt),
+            "The earlier crash must have a recorded settlement timestamp.");
+          assert.ok(earlierStatus.data.cashedOutAt <= later.round.startedAt,
+            "The earlier round must be settled before the next round starts; active rounds must not overlap.");
+          startedRounds = ordered;
+        } else {
+          assert.fail(`Unexpected concurrent start responses ${a.status} and ${b.status}: ${a.text}; ${b.text}`);
+        }
+
+        const winner = startedRounds[startedRounds.length - 1];
+        const totalStakeStarted = startedRounds.reduce((total, round) => total + round.round.stake, 0);
+        assert.equal(winner.state.balance, before.data.state.balance - totalStakeStarted,
+          "The latest start response must reflect exactly the stakes accepted so far.");
         const fairnessAfter = await api(baseUrl, "/api/fairness?limit=100", { token: auth });
-        assert.equal(fairnessAfter.data.totalRounds, fairnessBefore.data.totalRounds + 1,
-          "Concurrent starts must create exactly one round record.");
-  
+        assert.equal(fairnessAfter.data.totalRounds, fairnessBefore.data.totalRounds + startedRounds.length,
+          "Only accepted starts may create round records.");
+
         let settle = await api(baseUrl, "/api/round/cashout", {
           method: "POST", token: auth, headers: { "idempotency-key": idempotencyKey() }, body: { roundId: winner.round.id }
         });
@@ -380,8 +406,12 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
         assert.ok(["cashed_out", "busted"].includes(settle.data.result));
         const settledState = await api(baseUrl, "/api/state", { token: auth });
         assert.equal(settledState.data.state.activeRound, null);
-        assert.equal(settledState.data.profile.stats.roundsPlayed, 2);
-        assert.equal(settledState.data.profile.stats.totalStaked, 1 + winner.round.stake);
+        assert.equal(settledState.data.profile.stats.roundsPlayed,
+          before.data.profile.stats.roundsPlayed + startedRounds.length,
+          "Every accepted and settled round should update session statistics exactly once.");
+        assert.equal(settledState.data.profile.stats.totalStaked,
+          before.data.profile.stats.totalStaked + totalStakeStarted,
+          "Session statistics should include every accepted stake exactly once.");
         assert.ok(settledState.data.profile.leaderboard.length <= 5);
         for (let i = 1; i < settledState.data.profile.leaderboard.length; i += 1) {
           const previous = settledState.data.profile.leaderboard[i - 1];
@@ -447,8 +477,8 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
         "seedOffset must return the second seed epoch when requested");
 
       const refreshedAfterReset = await api(baseUrl, "/api/state", { token: auth });
-      assert.equal(refreshedAfterReset.data.profile.stats.roundsPlayed, 2,
-        "Session statistics must persist across game resets");
+      assert.equal(refreshedAfterReset.data.profile.stats.roundsPlayed, oldRounds.length,
+        "Session statistics must persist across game resets and include every settled round from the revealed epoch");
       for (const round of oldRounds) {
         assert.ok(["cashed_out", "busted"].includes(round.status), `Round ${round.id} was not settled.`);
         assert.equal(typeof round.crash_point, "number");

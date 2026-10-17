@@ -28,9 +28,27 @@ test("retention cleanup prunes only replayable old round-start cache entries", (
   assert.equal(intentCleanup.params[0], now - 60_000);
 });
 
-test("start responses are persisted for safe replay after the cache retention window", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const source = await readFile(new URL("../src/game-session.js", import.meta.url), "utf8");
-  assert.match(source, /UPDATE rounds SET response_json=\? WHERE id=\?/);
-  assert.match(source, /SELECT response_json FROM rounds WHERE idempotency_key=\?/);
+test("a saved round-start response can be replayed after the idempotency cache expires", async () => {
+  const idempotencyKey = "start-key-00000001";
+  const savedResponse = {
+    state: { balance: 878, roundNumber: 1 },
+    round: { id: "round-1", status: "running" }
+  };
+  const session = {
+    cachedIdempotent: () => null,
+    sql: {
+      exec(statement, ...parameters) {
+        assert.match(statement, /SELECT response_json FROM rounds WHERE idempotency_key/);
+        assert.deepEqual(parameters, [idempotencyKey]);
+        return { toArray: () => [{ response_json: JSON.stringify(savedResponse) }] };
+      }
+    }
+  };
+
+  const response = await GameSession.prototype.startRound.call(session, {}, idempotencyKey);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body.state, savedResponse.state);
+  assert.deepEqual(body.round, savedResponse.round);
+  assert.equal(typeof body.serverTime, "number");
 });

@@ -1,11 +1,7 @@
 import { signedSessionToken, verifySessionToken } from "./auth.js";
 import { logUnexpectedRequestError, logOperationalError } from "./request-logging.js";
 import { ApiError, json, readJsonLimited, SECURITY_HEADERS } from "./api-utils.js";
-import { crashPointFromDigest } from "./fairness.js";
-
 export { GameSession } from "./game-session.js";
-export { resolveCashoutMultiplierCents } from "./game-rules.js";
-export { crashPointFromDigest };
 
 function configuredOrigins(env) {
   // ALLOWED_ORIGIN remains supported for upgrades from the first deployed version.
