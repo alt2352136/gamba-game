@@ -1,6 +1,6 @@
 # gamba
 
-**[Play the live demo](https://elajeff.github.io/gamba-game/)** · **[View the source on GitHub](https://github.com/elajeff/gamba-game)**
+**[Play the game](https://elajeff.github.io/gamba-game/)** 
 
 A browser-based crash game built with vanilla JavaScript and Cloudflare Workers. Each player session is backed by a SQLite-backed Durable Object that owns the balance, loans, round state, and settlement. The browser handles input and presentation; the server decides outcomes and payouts.
 
