@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    name: Syntax and backend tests
+    name: Syntax and regression tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -22,14 +22,31 @@ jobs:
           node-version: 22
       - name: Install backend dependencies
         working-directory: backend
-        run: npm install --no-fund
+        run: npm ci --no-fund
       - name: Audit dependencies
         working-directory: backend
         run: npm audit --audit-level=high
       - name: Check JavaScript syntax
         run: |
           node --check game.js
+          node --check round-clock.js
+          node --check browser-storage.js
+          node --check game-renderer.js
+          node --check api-client.js
+          node --check galaxy-background.js
+          node --check fairness-client.js
           node --check backend/src/index.js
+          node --check backend/src/api-utils.js
+          node --check backend/src/game-session.js
+          node --check backend/src/session-stats.js
+          node --check backend/src/seed-crypto.js
+          node --check backend/src/game-rules.js
+          node --check backend/src/database-schema.js
+          node --check backend/src/auth.js
+          node --check backend/src/crypto-utils.js
+          node --check backend/src/fairness.js
+          node --check backend/src/request-logging.js
+          node --check tools/verify-fairness.js
       - name: Run regression suite
         working-directory: backend
         run: npm test

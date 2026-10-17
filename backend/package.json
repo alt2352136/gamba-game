@@ -8,7 +8,9 @@
   "scripts": {
     "dev": "wrangler dev --port 8788",
     "deploy": "wrangler deploy",
-    "test": "node --test"
+    "test": "npm run test:backend && npm run test:frontend",
+    "test:backend": "node --test \"test/*.test.js\"",
+    "test:frontend": "node --test \"../tests/frontend/*.test.js\""
   },
   "devDependencies": {
     "wrangler": "4.151.0"

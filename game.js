@@ -1,3 +1,10 @@
+import { ApiError, createApiClient } from "./api-client.js";
+import { createGameRenderer } from "./game-renderer.js";
+import { initGalaxyCanvas } from "./galaxy-background.js";
+import { verifyFairnessHistory } from "./fairness-client.js";
+import { calculateVisibleMultiplier, estimateServerTime, nextServerTimeAnchor } from "./round-clock.js";
+import { readLastReveal as loadLastReveal, readStoredSession, storeLastReveal, storeSession as persistSession } from "./browser-storage.js";
+
 /*
  * gamba — backend-connected browser client
  * The browser renders the game. The Cloudflare Worker owns balance, loans,
@@ -136,14 +143,38 @@
     lastReveal: null
   };
 
-  class ApiError extends Error {
-    constructor(status, data, rawText = "") {
-      super(data?.message || data?.error || `Backend request failed (HTTP ${status}).`);
-      this.name = "ApiError";
-      this.status = status;
-      this.code = data?.error || "http_error";
-      this.data = data;
-      this.rawText = rawText;
+  const api = createApiClient({
+    baseUrl: API_BASE,
+    getToken: () => game.token,
+    timeoutMs: API_REQUEST_TIMEOUT_MS
+  });
+
+  const renderer = createGameRenderer({
+    elements,
+    loanOptionButtons,
+    quickBetButtons,
+    loanStatusElements,
+    loans: LOANS,
+    maxMultiplier: MAX_MULTIPLIER,
+    getGame: () => game,
+    formatGold,
+    hasUsedAllLoans: () => hasUsedAllLoans()
+  });
+  const { setMessage, setRoundStatus, renderHistory, renderProfile, updateLoanOptions, updateMultiplierDisplay, updateUI } = renderer;
+
+  function loadStoredSession() {
+    try {
+      return readStoredSession(localStorage, sessionStorage, SESSION_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  function loadSavedLastReveal() {
+    try {
+      return loadLastReveal(localStorage, sessionStorage, LAST_REVEAL_KEY);
+    } catch {
+      return null;
     }
   }
 
@@ -151,17 +182,6 @@
     return Math.floor(Number(amount) || 0).toLocaleString("en-US");
   }
 
-  function setMessage(message, type = "") {
-    elements.roundMessage.className = "round-message";
-    if (type) elements.roundMessage.classList.add(type);
-    elements.roundMessage.textContent = message;
-  }
-
-  function setRoundStatus(text, state = "") {
-    elements.roundStatus.textContent = text;
-    elements.roundStatus.classList.toggle("is-live", state === "live");
-    elements.roundStatus.classList.toggle("is-busted", state === "busted");
-  }
 
   function newIdempotencyKey() {
     if (window.crypto?.randomUUID) return window.crypto.randomUUID().replace(/-/g, "");
@@ -177,186 +197,12 @@
     return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  function parseStoredSession(storage) {
-    try {
-      const value = storage.getItem(SESSION_STORAGE_KEY);
-      const parsed = value ? JSON.parse(value) : null;
-      return parsed && typeof parsed.token === "string" && typeof parsed.sessionId === "string" ? parsed : null;
-    } catch { return null; }
-  }
-
-  function readStoredSession() {
-    try {
-      const persistent = parseStoredSession(localStorage);
-      if (persistent) return persistent;
-      // Migrate a session from the earlier tab-only build so an update doesn't strand it.
-      const legacy = parseStoredSession(sessionStorage);
-      if (legacy) {
-        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(legacy));
-        sessionStorage.removeItem(SESSION_STORAGE_KEY);
-        return legacy;
-      }
-    } catch { /* Storage may be disabled; a fresh in-memory session can still be created. */ }
-    return null;
-  }
-
-  function storeSession() {
-    try {
-      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ sessionId: game.sessionId, token: game.token }));
-      try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch { /* migrated when available */ }
-    } catch {
-      setMessage("Persistent storage is unavailable. This game can still run, but reopening the browser may create a new session.", "danger");
-    }
-  }
-
-  async function api(path, options = {}) {
-    if (!API_BASE) throw new Error("Backend URL is not configured. Check backend-config.js.");
-    const method = options.method || "GET";
-    const headers = new Headers();
-    if (options.body !== undefined) headers.set("content-type", "application/json");
-    if (options.auth !== false && game.token) headers.set("authorization", `Bearer ${game.token}`);
-    if (options.idempotencyKey) headers.set("idempotency-key", options.idempotencyKey);
-
-    const requestOptions = {
-      method,
-      headers,
-      cache: "no-store"
-    };
-    if (options.body !== undefined) requestOptions.body = JSON.stringify(options.body);
-
-    const maxAttempts = options.idempotencyKey ? 2 : 1;
-    let lastNetworkError = null;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      let response;
-      let text;
-      const controller = typeof AbortController === "function" ? new AbortController() : null;
-      const externalSignal = options.signal || null;
-      const relayExternalAbort = () => controller?.abort(externalSignal?.reason);
-      if (externalSignal?.aborted) relayExternalAbort();
-      else externalSignal?.addEventListener("abort", relayExternalAbort, { once: true });
-      const timeoutId = controller
-        ? setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
-        : null;
-      try {
-        response = await fetch(`${API_BASE}${path}`, {
-          ...requestOptions,
-          ...(controller ? { signal: controller.signal } : externalSignal ? { signal: externalSignal } : {})
-        });
-        // Keep the timeout active while reading the body too, not just until headers arrive.
-        text = await response.text();
-      } catch (error) {
-        lastNetworkError = error;
-        if (attempt + 1 < maxAttempts) continue; // Retry only idempotent actions with the same key.
-        if (error?.name === "AbortError") {
-          throw new Error("The game server took too long to respond. Check your connection and try again.");
-        }
-        throw new Error("Couldn't reach the game server. Check your connection and try again.");
-      } finally {
-        if (timeoutId !== null) clearTimeout(timeoutId);
-        externalSignal?.removeEventListener("abort", relayExternalAbort);
-      }
-
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch { /* keep text for the error */ }
-      if (!response.ok) throw new ApiError(response.status, data, text);
-      return data || {};
-    }
-    throw lastNetworkError || new Error("Game server request failed.");
-  }
-
   function getBet() {
     const value = Number(elements.betInput.value);
     if (!Number.isSafeInteger(value) || value < 1 || value > game.balance) return null;
     return value;
   }
 
-  function renderHistory(history) {
-    const recent = [...(history || [])].reverse().slice(0, 10);
-    elements.historyList.replaceChildren();
-    if (!recent.length) {
-      const empty = document.createElement("p");
-      empty.className = "history-empty";
-      empty.textContent = "Completed rounds will appear here.";
-      elements.historyList.append(empty);
-      return;
-    }
-
-    for (const item of recent) {
-      const row = document.createElement("div");
-      row.className = "history-item";
-      const left = document.createElement("div");
-      left.className = "history-left";
-      const title = document.createElement("strong");
-      const resultLabel = item.result === "BUSTED" ? "BUST" : item.result === "CASHED OUT" ? "CASH OUT" : String(item.result || "ROUND");
-      title.textContent = `ROUND ${String(item.round).padStart(2, "0")} · ${resultLabel}`;
-      const details = document.createElement("small");
-      details.textContent = `${item.result === "BUSTED" ? "Crash" : "Cash-out"} x${Math.max(1, Number(item.multiplier) || 1).toFixed(2)} · Stake ${formatGold(item.stake)} · Payout ${formatGold(item.payout)}`;
-      left.append(title, details);
-
-      const repayments = Array.isArray(item.repayments) ? item.repayments : [];
-      if (repayments.length) {
-        const repayment = document.createElement("small");
-        repayment.className = "history-loan-note";
-        repayment.textContent = repayments.map((loan) => `${formatGold(loan.principal)} loan repaid ${formatGold(loan.repayment)}`).join(" · ");
-        left.append(repayment);
-      }
-
-      const right = document.createElement("div");
-      right.className = "history-right";
-      const multiplier = document.createElement("span");
-      multiplier.className = "history-multiplier";
-      multiplier.textContent = `x${Math.max(0, Number(item.multiplier) || 0).toFixed(2)}`;
-      const change = document.createElement("span");
-      change.className = `history-change ${(Number(item.net) || 0) >= 0 ? "positive" : "negative"}`;
-      const net = Number(item.net) || 0;
-      change.textContent = `${net >= 0 ? "+" : "−"}${formatGold(Math.abs(net))}`;
-      right.append(multiplier, change);
-      row.append(left, right);
-      elements.historyList.append(row);
-    }
-  }
-
-  function renderProfile(profile = game.profile) {
-    if (!profile || !elements.statRounds) return;
-    const stats = profile.stats || {};
-    const leaderboard = Array.isArray(profile.leaderboard) ? profile.leaderboard.slice(0, 5) : [];
-    elements.statRounds.textContent = formatGold(stats.roundsPlayed || 0);
-    elements.statWinRate.textContent = `${(Number(stats.winRate) || 0).toFixed(1)}%`;
-    const net = Number(stats.netResult) || 0;
-    elements.statNet.textContent = `${net >= 0 ? "+" : "−"}${formatGold(Math.abs(net))}`;
-    elements.statNet.classList.toggle("positive", net >= 0);
-    elements.statNet.classList.toggle("negative", net < 0);
-    elements.statBestMultiplier.textContent = Number(stats.bestMultiplier) > 0 ? `x${Number(stats.bestMultiplier).toFixed(2)}` : "—";
-    elements.statStaked.textContent = formatGold(stats.totalStaked || 0);
-    elements.statPayout.textContent = formatGold(stats.totalPayout || 0);
-    elements.leaderboardList.replaceChildren();
-    if (!leaderboard.length) {
-      const empty = document.createElement("p");
-      empty.className = "history-empty";
-      empty.textContent = "Your best cash-outs will appear here.";
-      elements.leaderboardList.append(empty);
-      return;
-    }
-    leaderboard.forEach((item, index) => {
-      const row = document.createElement("div");
-      row.className = "leaderboard-item";
-      const rank = document.createElement("span");
-      rank.className = "leaderboard-rank";
-      rank.textContent = `0${index + 1}`;
-      const detail = document.createElement("div");
-      detail.className = "leaderboard-detail";
-      const title = document.createElement("strong");
-      title.textContent = `x${Number(item.multiplier).toFixed(2)} · Batch ${item.epoch}, round ${item.round_number}`;
-      const sub = document.createElement("small");
-      sub.textContent = `Stake ${formatGold(item.stake)} · net ${Number(item.net) >= 0 ? "+" : "−"}${formatGold(Math.abs(Number(item.net) || 0))}`;
-      detail.append(title, sub);
-      const payout = document.createElement("strong");
-      payout.className = "leaderboard-payout";
-      payout.textContent = `${formatGold(item.payout)} G`;
-      row.append(rank, detail, payout);
-      elements.leaderboardList.append(row);
-    });
-  }
 
   function applyProfile(profile) {
     if (!profile || typeof profile !== "object") return;
@@ -389,7 +235,7 @@
       ? "No action needed to play. Verify previous rounds after a new game reveals their seed."
       : "Connecting to server…";
 
-    const savedReveal = game.lastReveal || readLastReveal();
+    const savedReveal = game.lastReveal || loadSavedLastReveal();
     game.lastReveal = savedReveal;
     if (savedReveal) {
       elements.lastRevealPanel.hidden = false;
@@ -403,94 +249,44 @@
     }
   }
 
-  function readLastReveal() {
-    try {
-      const text = localStorage.getItem(LAST_REVEAL_KEY) || sessionStorage.getItem(LAST_REVEAL_KEY);
-      const reveal = text ? JSON.parse(text) : null;
-      return reveal && reveal.serverSeed && reveal.commitment ? reveal : null;
-    } catch { return null; }
-  }
-
   function saveLastReveal(revealed) {
     game.lastReveal = {
       epoch: revealed.epoch,
       serverSeed: revealed.serverSeed,
       commitment: revealed.commitment
     };
-    try { localStorage.setItem(LAST_REVEAL_KEY, JSON.stringify(game.lastReveal)); } catch { try { sessionStorage.setItem(LAST_REVEAL_KEY, JSON.stringify(game.lastReveal)); } catch { /* The API remains authoritative if storage is unavailable. */ } }
+    try {
+      storeLastReveal(localStorage, sessionStorage, LAST_REVEAL_KEY, game.lastReveal);
+    } catch {
+      try { sessionStorage.setItem(LAST_REVEAL_KEY, JSON.stringify(game.lastReveal)); } catch { /* Browser storage may be unavailable. */ }
+    }
     renderFairness();
   }
 
-  function updateLoanOptions() {
-    const canBorrow = game.ready && game.waitingForLoan && game.balance <= 0 && !game.gameOver && !game.active;
-    loanOptionButtons.forEach((button) => {
-      const principal = Number(button.dataset.loan);
-      const loan = LOANS[principal];
-      const taken = Boolean(game.loansTaken[principal]);
-      const activeLoan = game.activeLoans.some((item) => item.principal === principal);
-      const repaid = Boolean(game.loansRepaid[principal]);
-      const tier = button.querySelector(".loan-tier");
-      button.disabled = !canBorrow || taken || game.loanPending;
-      tier.textContent = activeLoan ? "ACTIVE LOAN" : repaid ? "REPAID" : taken ? "USED THIS GAME" : loan.tier;
-      button.classList.toggle("loan-taken", taken);
-    });
-
-    Object.keys(LOANS).forEach((key) => {
-      const principal = Number(key);
-      const loan = LOANS[principal];
-      const { status, details } = loanStatusElements[key];
-      const activeLoan = game.activeLoans.find((item) => item.principal === principal);
-      const taken = Boolean(game.loansTaken[principal]);
-      const repaid = Boolean(game.loansRepaid[principal]);
-      status.textContent = activeLoan ? "ACTIVE" : repaid ? "REPAID" : taken ? "USED" : "AVAILABLE";
-      status.classList.toggle("is-active", Boolean(activeLoan));
-      status.classList.toggle("is-used", taken && !activeLoan && !repaid);
-      status.classList.toggle("is-repaid", repaid);
-      if (activeLoan) details.textContent = `Repay ${formatGold(activeLoan.repayment)} · ${activeLoan.roundsLeft} ${activeLoan.roundsLeft === 1 ? "round" : "rounds"} left`;
-      else if (repaid) details.textContent = `Repaid ${formatGold(loan.repayment)} gold`;
-      else details.textContent = `Repay ${formatGold(loan.repayment)} · ${loan.rounds}-round deadline`;
-    });
-
-    const allTaken = hasUsedAllLoans();
-    if (allTaken) elements.loanWarning.textContent = "All three loans have been used in this game.";
-    else if (game.activeLoans.length) elements.loanWarning.textContent = "Taking another loan extends existing deadlines according to the displayed rules.";
-    else elements.loanWarning.textContent = "Larger loans have higher fees and shorter deadlines.";
-    elements.bankLoanButton.disabled = !canBorrow || allTaken || game.loanPending;
-  }
 
   function estimatedServerTime() {
-    if (Number.isFinite(game.serverTimeAnchor) && Number.isFinite(game.performanceTimeAnchor)) {
-      return game.serverTimeAnchor + (performance.now() - game.performanceTimeAnchor);
-    }
-    return Date.now();
+    return estimateServerTime(
+      game.serverTimeAnchor,
+      game.performanceTimeAnchor,
+      performance.now(),
+      Date.now()
+    );
   }
 
   function syncServerClock(serverTime) {
-    if (serverTime === null || serverTime === undefined || !Number.isFinite(Number(serverTime))) return;
-    const incoming = Number(serverTime);
     const receivedAt = performance.now();
-    const projected = Number.isFinite(game.serverTimeAnchor) && Number.isFinite(game.performanceTimeAnchor)
-      ? game.serverTimeAnchor + (receivedAt - game.performanceTimeAnchor)
-      : null;
-    // Server timestamps are emitted before network delivery. Re-anchor without moving the
-    // estimated clock backward, and use performance.now() so system clock adjustments cannot
-    // make the visible multiplier jump ahead or rewind.
-    game.serverTimeAnchor = projected === null ? incoming : Math.max(projected, incoming);
-    game.performanceTimeAnchor = receivedAt;
+    const anchor = nextServerTimeAnchor(
+      game.serverTimeAnchor,
+      game.performanceTimeAnchor,
+      serverTime,
+      receivedAt
+    );
+    if (!anchor) return;
+    // Keep the visible clock from rewinding when a server response arrives late.
+    game.serverTimeAnchor = anchor.serverTimeAnchor;
+    game.performanceTimeAnchor = anchor.performanceTimeAnchor;
   }
 
-  function updateMultiplierDisplay() {
-    // Display the same cent-rounded value used as the release cap, rather than rounding
-    // the label upward while the underlying payout ceiling rounds down.
-    const shownCents = Math.max(100, Math.min(MAX_MULTIPLIER * 100, Math.floor(game.multiplier * 100)));
-    const shownMultiplier = shownCents / 100;
-    elements.multiplier.textContent = `x${shownMultiplier.toFixed(2)}`;
-    elements.meterTrack.setAttribute("aria-valuenow", shownMultiplier.toFixed(2));
-    const progress = ((shownMultiplier - 1) / (MAX_MULTIPLIER - 1)) * 100;
-    const clamped = Math.max(0, Math.min(100, progress));
-    elements.meterFill.style.width = `${clamped}%`;
-    elements.meterTrack.classList.toggle("busted", elements.multiplier.classList.contains("busted"));
-  }
 
   function getVisibleMultiplierCents() {
     // Read the exact value already painted to the player, not a newer unrendered frame.
@@ -499,28 +295,6 @@
     return Math.max(100, Math.min(MAX_MULTIPLIER * 100, Math.round(visibleMultiplier * 100)));
   }
 
-  function updateUI() {
-    elements.balance.textContent = formatGold(game.balance);
-    elements.betInput.max = String(game.balance);
-    updateMultiplierDisplay();
-    if (game.activeLoans.length) {
-      const due = game.activeLoans.reduce((sum, loan) => sum + loan.repayment, 0);
-      const nearest = Math.min(...game.activeLoans.map((loan) => loan.roundsLeft));
-      elements.loanStatus.textContent = `${game.activeLoans.length} ACTIVE`;
-      elements.loanDescription.textContent = `Outstanding: ${formatGold(due)} gold`;
-      elements.loanRounds.textContent = `${nearest} ${nearest === 1 ? "round" : "rounds"} to deadline`;
-    } else {
-      elements.loanStatus.textContent = Object.values(game.loansRepaid).some(Boolean) ? "REPAID" : "NONE";
-      elements.loanDescription.textContent = "No active loans";
-      elements.loanRounds.textContent = "—";
-    }
-    const canPlay = game.ready && !game.gameOver && !game.waitingForLoan && game.balance > 0 && !game.startPending && !game.initializing;
-    elements.holdButton.disabled = !game.ready || game.initializing || game.recoveredRound || (!game.active && (game.gameOver || game.waitingForLoan || game.balance <= 0));
-    elements.betInput.disabled = !canPlay || game.active;
-    elements.maxButton.disabled = !canPlay || game.active;
-    quickBetButtons.forEach((button) => { button.disabled = !canPlay || game.active; });
-    updateLoanOptions();
-  }
 
   function applyState(state, profile = null, { updateModals = true } = {}) {
     if (!state) throw new Error("Backend returned no game state.");
@@ -583,8 +357,12 @@
   function updateRoundFrame() {
     game.animationFrameId = null;
     if (!game.active || !game.activeRound || game.cashoutPending) return;
-    const elapsed = Math.max(0, (estimatedServerTime() - Number(game.activeRound.startedAt)) / 1000);
-    game.multiplier = Math.min(MAX_MULTIPLIER, 1 + elapsed * GROWTH_PER_SECOND);
+    game.multiplier = calculateVisibleMultiplier(
+      estimatedServerTime(),
+      game.activeRound.startedAt,
+      GROWTH_PER_SECOND,
+      MAX_MULTIPLIER
+    );
     // This animation is cosmetic. Only the server decides if a cash-out beats the crash.
     updateMultiplierDisplay();
     scheduleAnimation();
@@ -768,7 +546,7 @@
 
   async function initializeBackend() {
     if (!API_BASE) throw new Error("Backend URL is not configured. Open backend-config.js and set GAMBA_API_BASE.");
-    const stored = readStoredSession();
+    const stored = loadStoredSession();
     if (stored) {
       game.sessionId = stored.sessionId;
       game.token = stored.token;
@@ -800,7 +578,14 @@
     if (!created.token || !created.sessionId || !created.state) throw new Error("The backend returned an incomplete session response.");
     game.sessionId = created.sessionId;
     game.token = created.token;
-    storeSession();
+    try {
+      persistSession(localStorage, sessionStorage, SESSION_STORAGE_KEY, {
+        sessionId: game.sessionId,
+        token: game.token
+      });
+    } catch {
+      setMessage("Persistent storage is unavailable. This game can still run, but reopening the browser may create a new session.", "danger");
+    }
     syncServerClock(created.serverTime);
     updateCommitment(created);
     applyState(created.state, created.profile);
@@ -1357,88 +1142,16 @@
     }
   }
 
-  function hexToBytes(hex) {
-    if (typeof hex !== "string" || !/^(?:[0-9a-f]{2})+$/i.test(hex)) throw new Error("Invalid hexadecimal server seed.");
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-    return bytes;
-  }
-
-  async function sha256HexUtf8(text) {
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
-    return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
   async function verifyRevealedFairness() {
     if (!game.ready) return;
     elements.verifyFairnessButton.disabled = true;
     elements.verifyFairnessStatus.className = "fairness-verification";
     elements.verifyFairnessStatus.textContent = "Checking past rounds…";
     try {
-      const pageSize = 100;
-      const first = await api(`/api/fairness?limit=${pageSize}&roundOffset=0&seedOffset=0`);
-      const totalRounds = Number(first.totalRounds ?? first.rounds?.length ?? 0);
-      const totalSeeds = Number(first.totalSeeds ?? first.seeds?.length ?? 0);
-      const rounds = [...(first.rounds || [])];
-      const seeds = [...(first.seeds || [])];
-      const totalPages = Math.max(totalRounds, totalSeeds);
-      for (let offset = pageSize; offset < totalPages; offset += pageSize) {
-        elements.verifyFairnessStatus.textContent = `Loading records… ${Math.min(offset, totalPages).toLocaleString("en-US")} of ${totalPages.toLocaleString("en-US")}`;
-        const roundOffset = Math.min(offset, totalRounds);
-        const seedOffset = Math.min(offset, totalSeeds);
-        const page = await api(`/api/fairness?limit=${pageSize}&roundOffset=${roundOffset}&seedOffset=${seedOffset}`);
-        rounds.push(...(page.rounds || []));
-        seeds.push(...(page.seeds || []));
-      }
-      if (rounds.length !== totalRounds || seeds.length !== totalSeeds) {
-        throw new Error(`History pagination incomplete (loaded ${rounds.length}/${totalRounds} rounds and ${seeds.length}/${totalSeeds} seeds). Try again.`);
-      }
-
-      const seedsByEpoch = new Map(seeds.map((row) => [Number(row.epoch), row]));
-      let verifiedSeeds = 0;
-      let verifiedRounds = 0;
-      let pendingRounds = 0;
-      const failures = [];
-      for (const seedRow of seeds) {
-        if (typeof seedRow.revealed_seed !== "string") continue;
-        const expectedCommitment = await sha256HexUtf8(seedRow.revealed_seed);
-        if (expectedCommitment !== seedRow.commitment) {
-          failures.push(`Seed batch ${seedRow.epoch}: commitment mismatch`);
-          continue;
-        }
-        verifiedSeeds += 1;
-      }
-
-      for (const round of rounds) {
-        const seedRow = seedsByEpoch.get(Number(round.epoch));
-        if (!seedRow) {
-          failures.push(`Round ${round.id}: no seed commitment record for batch ${round.epoch}`);
-          continue;
-        }
-        if (typeof seedRow.revealed_seed !== "string") {
-          pendingRounds += 1;
-          continue;
-        }
-        if (round.crash_point === null || round.crash_point === undefined || round.status === "running") {
-          failures.push(`Round ${round.id}: revealed batch has an unsettled round`);
-          continue;
-        }
-        if (await sha256HexUtf8(seedRow.revealed_seed) !== seedRow.commitment) continue;
-        const serverKey = await crypto.subtle.importKey("raw", hexToBytes(seedRow.revealed_seed), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const digest = new Uint8Array(await crypto.subtle.sign("HMAC", serverKey, new TextEncoder().encode(`${round.client_seed}:${round.nonce}`)));
-        const first13 = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 13);
-        const random52 = BigInt(`0x${first13}`);
-        const denominator = 1n << 52n;
-        const edge = Number(round.edge_percent ?? first.houseEdgePercent ?? 1);
-        const rtp = BigInt(Math.round(100 - edge));
-        let cents = (rtp * denominator) / (denominator - random52);
-        if (cents < 100n) cents = 100n;
-        if (cents > 100_000_000n) cents = 100_000_000n;
-        const calculated = Number(cents) / 100;
-        if (Math.abs(calculated - Number(round.crash_point)) > 1e-9) failures.push(`Round ${round.id}: crash point mismatch`);
-        else verifiedRounds += 1;
-      }
-
+      const report = await verifyFairnessHistory(api, (message) => {
+        elements.verifyFairnessStatus.textContent = message;
+      });
+      const { verifiedSeeds, verifiedRounds, pendingRounds, failures } = report;
       if (failures.length) {
         elements.verifyFairnessStatus.textContent = `VERIFICATION FAILED (${failures.length} issue(s)): ${failures.slice(0, 5).join("; ")}${failures.length > 5 ? "; more issues omitted" : ""}`;
         elements.verifyFairnessStatus.classList.add("is-error");
@@ -1550,182 +1263,8 @@
     if (event.key === "Escape" && !elements.loanModal.classList.contains("hidden")) closeLoanModal();
   });
 
-  function initGalaxyCanvas() {
-    const canvas = document.querySelector(".galaxy-particles");
-    if (!canvas) return;
-    const context = canvas.getContext("2d", { alpha: true, desynchronized: true });
-    if (!context) return;
-
-    const random = (() => {
-      // A stable seed keeps the particle composition art-directed between visits.
-      let seed = 0x67a11a;
-      return () => {
-        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-        return seed / 4294967296;
-      };
-    })();
-    const normal = () => {
-      const u = Math.max(0.00001, random());
-      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random());
-    };
-
-    // Fine, low-contrast dust carries the color directly; no blur, bloom, or hard nuclei.
-    // Muted colors are deliberately restrained so the starfield and multiplier stay readable.
-    const palette = [
-      [112, 91, 174],  // shadow violet
-      [139, 91, 166],  // muted plum
-      [160, 83, 133],  // dusty rose
-      [174, 61, 91],   // subdued crimson
-      [160, 146, 199], // dim lilac
-      [86, 76, 135]    // deep violet
-    ];
-    const fillStyles = palette.map(([r, g, b]) => Array.from(
-      { length: 37 },
-      (_, alpha) => `rgba(${r},${g},${b},${(alpha / 100).toFixed(2)})`
-    ));
-    let particles = [];
-    let width = 0;
-    let height = 0;
-    let dpr = 1;
-
-    function chooseColor(x, y) {
-      // A low-frequency color drift mixes warm and cool tones across the full formation.
-      // No single coordinate becomes a bright red island or a planet-like center.
-      const wave = 0.5 + 0.5 * Math.sin((x / width) * Math.PI * 2.1 + Math.sin((y / height) * Math.PI * 1.6) * 0.8);
-      const roll = random();
-      if (roll < 0.10 + wave * 0.07) return 3;
-      if (roll < 0.28 + wave * 0.07) return 2;
-      if (roll < 0.52) return 1;
-      if (roll < 0.80) return 0;
-      if (roll < 0.94) return 5;
-      return 4;
-    }
-
-    function sampleCloudX() {
-      // Two wide, overlapping density regions make elongated clusters; their overlap keeps them connected.
-      // There are no focal centers, rings, or bright spherical bodies.
-      if (random() < 0.58) {
-        const side = random() < 0.5 ? -1 : 1;
-        let candidate;
-        do {
-          candidate = width * (0.5 + side * (0.235 + normal() * 0.13));
-        } while (candidate < 0 || candidate > width);
-        return candidate;
-      }
-      return random() * width;
-    }
-
-    function buildParticles() {
-      particles = [];
-      // A restrained field of fine dust; density makes cloud shapes, not bright particles or blur.
-      const count = Math.max(1800, Math.min(3600, Math.round(width * height / 58)));
-      const centerY = height * 0.49;
-
-      for (let i = 0; i < count; i += 1) {
-        const source = random();
-        let x;
-        let y;
-        let kind;
-
-        if (source < 0.38) {
-          x = sampleCloudX();
-          const nx = (x / width - 0.5) * 2;
-          const irregularity = 0.012 * Math.sin(nx * 7.2 + random() * 0.5) + 0.009 * Math.sin(nx * 13.4 + random());
-          // Main dust lane: broad and broken up, with no nucleus or closed orbit.
-          const spine = centerY + height * (0.035 * Math.sin(nx * 2.7 + 0.5) + 0.025 * Math.sin(nx * 5.3 - 0.7));
-          y = spine + normal() * height * (0.095 + irregularity);
-          kind = "main-dust";
-        } else if (source < 0.64) {
-          x = sampleCloudX();
-          const nx = (x / width - 0.5) * 2;
-          const irregularity = 0.012 * Math.sin(nx * 7.2 + random() * 0.5) + 0.009 * Math.sin(nx * 13.4 + random());
-          // Loose upper filament overlaps the main lane instead of reading as a separate body.
-          const spine = height * (0.30 + 0.075 * nx + 0.032 * Math.sin(nx * 3.7 + 0.9));
-          y = spine + normal() * height * (0.063 + irregularity * 0.6);
-          kind = "upper-dust";
-        } else if (source < 0.86) {
-          x = sampleCloudX();
-          const nx = (x / width - 0.5) * 2;
-          const irregularity = 0.012 * Math.sin(nx * 7.2 + random() * 0.5) + 0.009 * Math.sin(nx * 13.4 + random());
-          // A faint lower wisp gives the field depth but leaves open space between streams.
-          const spine = height * (0.68 - 0.055 * nx + 0.035 * Math.sin(nx * 3.1 - 0.8));
-          y = spine + normal() * height * (0.067 + irregularity * 0.6);
-          kind = "lower-dust";
-        } else {
-          // Sparse background grains keep the dark space from feeling like a solid flat panel.
-          x = random() * width;
-          y = random() * height;
-          kind = "background-dust";
-        }
-
-        if (y < -height * 0.12 || y > height * 1.12) continue;
-        const color = chooseColor(x, y);
-        const sparkle = random() < 0.004;
-        const size = sparkle ? 0.9 + random() * 0.35 : 0.42 + Math.pow(random(), 1.65) * (kind === "background-dust" ? 0.85 : 1.5);
-        let alpha;
-        if (sparkle) alpha = 0.24 + random() * 0.08;
-        else if (kind === "main-dust") alpha = 0.11 + Math.pow(random(), 1.8) * 0.25;
-        else if (kind === "upper-dust" || kind === "lower-dust") alpha = 0.07 + Math.pow(random(), 1.9) * 0.16;
-        else alpha = 0.025 + random() * 0.07;
-
-        const phase = random() * Math.PI * 2;
-        // Bake the tiny initial offset into the point; no phase or kind metadata is needed later.
-        particles.push({
-          x: x + Math.sin(phase) * 0.42,
-          y: y + Math.cos(phase) * 0.48,
-          size,
-          alpha,
-          color
-        });
-      }
-    }
-
-    function drawStaticField() {
-      context.clearRect(0, 0, width, height);
-
-      for (const particle of particles) {
-        const { x, y } = particle;
-        if (x < -5 || x > width + 5 || y < -5 || y > height + 5) continue;
-
-        // Keep the readout area quieter without hiding the moving CSS star trails.
-        const nx = (x - width * 0.5) / (width * 0.26);
-        const ny = (y - height * 0.44) / (height * 0.30);
-        const centerQuiet = 1 - 0.64 * Math.exp(-((nx * nx) + (ny * ny)) * 1.05);
-        const alpha = Math.min(0.31, particle.alpha * centerQuiet);
-        const alphaStep = Math.min(36, Math.max(0, Math.round(alpha * 100)));
-        context.fillStyle = fillStyles[particle.color][alphaStep];
-        context.fillRect(x, y, particle.size, particle.size);
-      }
-      // The canvas retains the painted pixels, so release the temporary particle objects.
-      particles = [];
-    }
-
-    function resize() {
-      // Read the untransformed parent box: the canvas itself has a subtle CSS drift animation.
-      const rect = (canvas.parentElement || canvas).getBoundingClientRect();
-      const nextWidth = Math.max(1, rect.width);
-      const nextHeight = Math.max(1, rect.height);
-      const nextDpr = Math.min(window.devicePixelRatio || 1, 1.5);
-      if (Math.abs(nextWidth - width) < 1 && Math.abs(nextHeight - height) < 1 && nextDpr === dpr) return;
-      width = nextWidth;
-      height = nextHeight;
-      dpr = nextDpr;
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
-      context.setTransform(dpr, 0, 0, dpr, 0, 0);
-      buildParticles();
-      drawStaticField();
-    }
-
-    // Expensive particle placement and painting now happen only at startup or resize.
-    // CSS handles the very slight motion; no per-frame particle loop competes with input events.
-    const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
-    if (resizeObserver) resizeObserver.observe(canvas.parentElement);
-    else window.addEventListener("resize", resize, { passive: true });
-    resize();
-  }
   async function boot() {
-    game.lastReveal = readLastReveal();
+    game.lastReveal = loadSavedLastReveal();
     renderFairness();
     updateUI();
     try {

@@ -5,11 +5,24 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const [html, js, css] = await Promise.all([
+const [html, js, css, galaxy, fairnessClient, apiClient, renderer, roundClock, browserStorage] = await Promise.all([
   readFile(resolve(root, "index.html"), "utf8"),
   readFile(resolve(root, "game.js"), "utf8"),
-  readFile(resolve(root, "styles.css"), "utf8")
+  readFile(resolve(root, "styles.css"), "utf8"),
+  readFile(resolve(root, "galaxy-background.js"), "utf8"),
+  readFile(resolve(root, "fairness-client.js"), "utf8"),
+  readFile(resolve(root, "api-client.js"), "utf8"),
+  readFile(resolve(root, "game-renderer.js"), "utf8"),
+  readFile(resolve(root, "round-clock.js"), "utf8"),
+  readFile(resolve(root, "browser-storage.js"), "utf8")
 ]);
+
+test("public backend configuration loads before the ES module client", () => {
+  const configPosition = html.indexOf('src="backend-config.js"');
+  const appPosition = html.indexOf('type="module" src="game.js"');
+  assert.ok(configPosition >= 0 && appPosition > configPosition);
+  assert.doesNotMatch(html.slice(configPosition - 20, configPosition), /defer/);
+});
 
 test("HTML IDs are unique and every static JavaScript ID lookup exists", () => {
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
@@ -43,19 +56,20 @@ test("single-action bankruptcy modal centers Accept Defeat when all loans are us
 });
 
 test("the cosmic particle field is painted on initialization or resize, not each animation frame", () => {
-  const match = js.match(/function initGalaxyCanvas\(\)\s*\{([\s\S]*?)\n  \}\n  async function boot/);
-  assert.ok(match, "Galaxy renderer should remain a self-contained function");
+  const match = galaxy.match(/export function initGalaxyCanvas\(\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(match, "Galaxy renderer should remain a self-contained module function");
   assert.match(match[1], /function drawStaticField\(\)/);
   assert.match(match[1], /drawStaticField\(\)/);
   assert.doesNotMatch(match[1], /requestAnimationFrame|setInterval/);
+  assert.match(js, /import \{ initGalaxyCanvas \} from "\.\/galaxy-background\.js"/);
   assert.match(css, /animation:\s*galaxy-drift/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
 });
 
 test("rendered particle data excludes metadata no longer needed after construction", () => {
-  assert.match(js, /particles\.push\(\{[\s\S]*?x:\s*x\s*\+\s*Math\.sin\(phase\)[\s\S]*?color\s*\n\s*\}\)/);
-  assert.doesNotMatch(js, /particle\.phase|particle\.kind/);
-  assert.match(js, /context\.fillRect\(x, y, particle\.size, particle\.size\);\s*\}[^\n]*\n\s*\/\/[^\n]*\n\s*particles = \[\];/);
+  assert.match(galaxy, /particles\.push\(\{[\s\S]*?x:\s*x\s*\+\s*Math\.sin\(phase\)[\s\S]*?color\s*\n\s*\}\)/);
+  assert.doesNotMatch(galaxy, /particle\.phase|particle\.kind/);
+  assert.match(galaxy, /context\.fillRect\(x, y, particle\.size, particle\.size\);\s*\}[^\n]*\n\s*\/\/[^\n]*\n\s*particles = \[\];/);
 });
 
 test("loan exhaustion checks all defined tiers and tolerates partial server flags safely", () => {
@@ -73,11 +87,12 @@ test("round settlement chooses one modal path per server response", () => {
 
 test("API requests have a bounded timeout that also covers reading the response body", () => {
   assert.match(js, /const API_REQUEST_TIMEOUT_MS = 12_000/);
-  assert.match(js, /new AbortController\(\)/);
-  assert.match(js, /text = await response\.text\(\);/);
-  assert.match(js, /controller\.abort\(\)/);
-  assert.match(js, /if \(timeoutId !== null\) clearTimeout\(timeoutId\)/);
-  assert.match(js, /const maxAttempts = options\.idempotencyKey \? 2 : 1/);
+  assert.match(js, /import \{ ApiError, createApiClient \} from "\.\/api-client\.js"/);
+  assert.match(apiClient, /new AbortController\(\)/);
+  assert.match(apiClient, /text = await response\.text\(\);/);
+  assert.match(apiClient, /controller\.abort\(\)/);
+  assert.match(apiClient, /if \(timeoutId !== null\) clearTimeout\(timeoutId\)/);
+  assert.match(apiClient, /const maxAttempts = options\.idempotencyKey \? 2 : 1/);
 });
 
 
@@ -156,11 +171,15 @@ test("server-push settlement is guarded against races with HTTP responses and po
 
 
 test("round multiplier uses a server-anchored monotonic clock and syncs on start", () => {
-  assert.match(js, /function estimatedServerTime\(\)[\s\S]*?performance\.now\(\)/);
+  assert.match(js, /import \{ calculateVisibleMultiplier, estimateServerTime, nextServerTimeAnchor \} from "\.\/round-clock\.js"/);
+  assert.match(js, /function estimatedServerTime\(\)[\s\S]*?estimateServerTime\(/);
+  assert.match(roundClock, /export function estimateServerTime/);
+  assert.match(roundClock, /export function nextServerTimeAnchor/);
   assert.match(js, /syncServerClock\(response\.serverTime\)/);
   const match = js.match(/function updateRoundFrame\(\)\s*\{([\s\S]*?)\n  \}/);
   assert.ok(match, "The frame updater should remain easy to audit");
-  assert.match(match[1], /estimatedServerTime\(\) - Number\(game\.activeRound\.startedAt\)/);
+  assert.match(match[1], /calculateVisibleMultiplier\(/);
+  assert.match(match[1], /estimatedServerTime\(\)/);
   assert.doesNotMatch(match[1], /Date\.now\(\)/, "Local wall-clock skew must not drive the multiplier");
 });
 
@@ -179,7 +198,7 @@ test("cash-out sends the exact visible multiplier as a cent-rounded cap", () => 
   assert.match(js, /function getVisibleMultiplierCents\(\)[\s\S]*?elements\.multiplier\.textContent/);
   assert.match(js, /body: \{ roundId, requestedMultiplierCents \}/);
   assert.match(js, /body: \{ startKey, requestedMultiplierCents: 100 \}/);
-  assert.match(js, /const shownCents = Math\.max\(100, Math\.min\(MAX_MULTIPLIER \* 100, Math\.floor\(game\.multiplier \* 100\)\)\)/);
+  assert.match(renderer, /const shownCents = Math\.max\(100, Math\.min\(maxMultiplier \* 100, Math\.floor\(game\.multiplier \* 100\)\)\)/);
 });
 
 
@@ -206,4 +225,19 @@ test("temporary timing diagnostics are absent from the production client", () =>
     assert.doesNotMatch(js, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
       `Production client should not contain temporary diagnostic marker: ${marker}`);
   }
+});
+
+
+test("browser helpers are split by responsibility without changing the game DOM contract", () => {
+  assert.match(html, /<script type="module" src="game\.js">/);
+  assert.match(js, /from "\.\/browser-storage\.js"/);
+  assert.match(browserStorage, /export function readStoredSession/);
+  assert.match(browserStorage, /export function storeLastReveal/);
+  assert.match(js, /import \{ verifyFairnessHistory \} from "\.\/fairness-client\.js"/);
+  assert.match(js, /import \{ ApiError, createApiClient \} from "\.\/api-client\.js"/);
+  assert.match(fairnessClient, /export async function verifyFairnessHistory\(api, onProgress/);
+  assert.doesNotMatch(fairnessClient, /document\.querySelector|document\.getElementById/);
+  assert.match(js, /import \{ createGameRenderer \} from "\.\/game-renderer\.js"/);
+  assert.match(renderer, /export function createGameRenderer/);
+  assert.doesNotMatch(renderer, /fetch\(|createApiClient|startRound\(/);
 });

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,7 +119,11 @@ test("gamba backend local integration and regression suite", { timeout: 120_000 
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "gamba-backend-tests-"));
   const tempSrc = path.join(tempRoot, "src");
   await mkdir(tempSrc, { recursive: true });
-  await copyFile(path.join(BACKEND_DIR, "src", "index.js"), path.join(tempSrc, "index.js"));
+  // The Worker is split into small modules; copy the complete source set into the isolated test app.
+  const sourceFiles = await readdir(path.join(BACKEND_DIR, "src"));
+  for (const filename of sourceFiles.filter((name) => name.endsWith(".js"))) {
+    await copyFile(path.join(BACKEND_DIR, "src", filename), path.join(tempSrc, filename));
+  }
 
   const testSessionSecret = randomBytes(32).toString("hex");
   const testSeedKey = randomBytes(32).toString("base64");
