@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { crashPointFromDigest } from "../src/index.js";
+import { crashPointFromDigest } from "../src/fairness.js";
 
 test("crash formula clamps outcomes below x1.00", () => {
   assert.equal(crashPointFromDigest(new Uint8Array(32), 1), 1);

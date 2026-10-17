@@ -7,12 +7,12 @@ Cloudflare Worker API with one SQLite-backed Durable Object per anonymous game s
 Requirements: Node.js 22+. From this directory, run:
 
 ```powershell
-npm.cmd install
+npm.cmd ci
 npm.cmd test
 npm.cmd run dev
 ```
 
-Keep the generated `package-lock.json` in Git for reproducible installs. If npm 11 reports blocked scripts for `esbuild` or `workerd`, review and approve those Wrangler dependencies with `npm.cmd install-scripts approve esbuild workerd`, then rerun `npm.cmd install`.
+Keep the generated `package-lock.json` in Git for reproducible installs. If npm 11 reports blocked scripts for `esbuild` or `workerd`, review and approve those Wrangler dependencies with `npm.cmd install-scripts approve esbuild workerd`, then rerun `npm.cmd ci`.
 
 The Worker listens on `http://localhost:8788`; serve the frontend separately from the repository root at `http://localhost:5500`.
 
@@ -28,7 +28,7 @@ SEED_ENCRYPTION_KEY="$seedKey"
 Remove-Variable sessionSecret, seedKey
 ```
 
-The integration suite starts a temporary local Worker with test-only secrets and isolated storage. It never calls production. The formula, loan, alarm and guardrail tests run as regular Node tests.
+The integration suite starts a temporary local Worker with test-only secrets and isolated storage. It never calls production. Backend unit/session tests live in `test/`; frontend module and contract tests live in `../tests/frontend/`. `npm.cmd test` runs both groups. Formula, loan, alarm, and session-invariant tests run as regular Node tests.
 
 ## Secrets
 

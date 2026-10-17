@@ -3,6 +3,8 @@ node_modules/
 backend/node_modules/
 backend/.dev.vars
 backend/.wrangler/
+backend/.mf/
+.mf/
 .wrangler/
 .env
 .env.*

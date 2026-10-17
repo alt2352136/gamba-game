@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GameSession } from "../src/index.js";
+import { GameSession } from "../src/game-session.js";
 
 function alarmHarness({ round, now = Date.now() } = {}) {
   const calls = { busted: 0, capped: 0, scheduled: [] };

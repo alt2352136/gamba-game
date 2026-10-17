@@ -1,5 +1,7 @@
 # gamba
 
+**[Play the live demo](https://elajeff.github.io/gamba-game/)** · **[View the source on GitHub](https://github.com/elajeff/gamba-game)**
+
 A browser-based crash game built with vanilla JavaScript and Cloudflare Workers. Each player session is backed by a SQLite-backed Durable Object that owns the balance, loans, round state, and settlement. The browser handles input and presentation; the server decides outcomes and payouts.
 
 ## Technical highlights
@@ -8,7 +10,9 @@ A browser-based crash game built with vanilla JavaScript and Cloudflare Workers.
 - **Verifiable outcomes:** Each server seed is committed by SHA-256 before use. HMAC-SHA-256 and the first 52 digest bits determine the crash point; unrevealed seeds are encrypted with AES-256-GCM and revealed at rotation. Verification can reproduce recorded outcomes, but cannot prove that no round was omitted or that deployed code never changed.
 - **Low-latency round handling:** An authenticated WebSocket pushes settlement events. An idempotent release-intent endpoint handles a release that arrives while round startup is still in flight, avoiding an unnecessary sequential request. Adaptive status polling provides recovery when push is unavailable; settlement remains server-controlled.
 - **Security controls:** Signed session tokens, exact-origin CORS, bounded request bodies, and Cloudflare-managed secrets protect the API boundary. Non-extractable `CryptoKey` objects are cached for warm requests without caching a plaintext server seed as a long-lived field.
-- **Regression tests and CI:** Node tests cover deterministic outcomes, malformed requests, authentication, duplicate operations, concurrent starts, loan rules, alarms, and event-delivery recovery. GitHub Actions runs checks on pushes and pull requests.
+- **Regression tests and CI:** Node tests cover deterministic outcomes, malformed requests, authentication, duplicate operations, concurrent starts, loan rules, alarms, event-delivery recovery, and browser-module contracts. Backend and frontend tests live in separate directories and run together through `npm.cmd test`. GitHub Actions runs the same suite on pushes and pull requests.
+- **Reviewable source layout:** The browser API client, DOM renderer, fairness verifier, and static galaxy renderer are separate modules. Backend request routing, request parsing, authentication, shared crypto helpers, fairness math, and request error logging have clear module boundaries; session lifecycle and database transactions remain together where they must stay atomic.
+- **Independent fairness check:** `tools/verify-fairness.js` independently recomputes supplied seed commitments and round outcomes using Node's built-in crypto module. See [the verifier guide](docs/fairness-verification.md) and [architecture notes](docs/architecture.md).
 - **Efficient client rendering:** The cosmic dust field is rasterized once and moved with CSS rather than recalculating every particle per frame. The client pauses work when the page is hidden, requests only the ten history entries it displays, and uses pointer capture with touch-selection suppression plus keyboard controls for the hold interaction.
 
 ## How the crash multiplier is calculated
@@ -31,17 +35,27 @@ The browser estimates the multiplier from a server timestamp using `performance.
 
 The server publishes a SHA-256 commitment before using a seed and reveals the seed at rotation. This lets anyone recompute recorded results against the commitment and formula, but it does not prove the completeness of the public history or the immutability of deployed code.
 
+## Independent fairness verification
+
+Prepare a JSON export containing the full `seeds` and `rounds` arrays from the public `/api/fairness` responses, then run this from the repository root:
+
+```sh
+node tools/verify-fairness.js fairness-export.json
+```
+
+The tool reports verified, pending, or mismatched records. It uses an independent implementation rather than importing the Worker formula. A clean result verifies only the supplied records; it cannot prove that no history was omitted or that deployed code was never changed. See [`docs/fairness-verification.md`](docs/fairness-verification.md) for the input format and limits.
+
 ## Run locally
 
 Requirements: Node.js 22+ and Python 3.
 
 ```powershell
 cd backend
-npm.cmd install
+npm.cmd ci
 npm.cmd test
 ```
 
-Commit the generated `backend/package-lock.json` for reproducible installs. If npm blocks the `esbuild` or `workerd` install scripts, review and approve them, then rerun installation. For the frontend, start a server from the repository root in a separate terminal:
+The committed `backend/package-lock.json` makes dependency installation reproducible. If your npm settings block the `esbuild` or `workerd` install scripts, review npm’s prompt and approve the required scripts before rerunning installation. For the frontend, start a server from the repository root in a separate terminal:
 
 ```powershell
 py -m http.server 5500
@@ -54,6 +68,6 @@ Open `http://localhost:5500`; do not use a `file://` URL. `backend-config.js` co
 1. Set `ALLOWED_ORIGINS` in `backend/wrangler.toml` to comma-separated exact origins such as `"http://localhost:5500,https://USERNAME.github.io"`. Do not include the repository path.
 2. Configure `SESSION_SECRET` and `SEED_ENCRYPTION_KEY` as Cloudflare Worker secrets. Never put their values in Git.
 3. Run `npm.cmd test` from `backend/`; deploy only after the full suite passes, using `npm.cmd run deploy`.
-4. Enable GitHub Pages from the repository root, keeping `index.html`, `styles.css`, `game.js`, `backend-config.js`, and `honk-icon.png` at the root.
+4. Enable GitHub Pages from the repository root, keeping `index.html`, `styles.css`, `game.js`, `api-client.js`, `game-renderer.js`, `galaxy-background.js`, `fairness-client.js`, `round-clock.js`, `browser-storage.js`, `backend-config.js`, and `honk-icon.png` at the root.
 
 Back up both secrets securely. Losing or replacing the encryption key without migrating stored data makes unrevealed seeds unreadable. Anonymous session data persists in the same browser profile and does not sync across devices.

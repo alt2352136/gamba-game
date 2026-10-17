@@ -1,0 +1,10 @@
+{
+  "description": "Fixed vector for the documented SHA-256 commitment and HMAC-SHA-256 crash formula.",
+  "serverSeed": "0000000000000000000000000000000000000000000000000000000000000000",
+  "commitment": "60e05bd1b195af2f94112fa7197a5c88289058840ce7c6df9693756bc6250f55",
+  "clientSeed": "known-client-seed",
+  "nonce": 1,
+  "edgePercent": 1,
+  "hmacSha256": "4aecdd5c2490d3a2f3480f21ae32eb28f8068f888019af6c5d64298511f32cd2",
+  "crashPoint": 1.39
+}

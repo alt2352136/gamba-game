@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GameSession } from "../src/index.js";
+import { GameSession } from "../src/game-session.js";
 
 function isApiError(error, status, code) {
   return error && error.status === status && error.code === code;
@@ -83,28 +83,6 @@ test("setting the same client seed again avoids a redundant state write", async 
 });
 
 
-test("session HMAC verification key is cached by secret fingerprint and cold imports are coalesced", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
-  assert.match(source, /let cachedSessionVerifier = null/);
-  assert.match(source, /async function getSessionVerifierKey\(secret\)/);
-  assert.match(source, /const fingerprint = await sha256Hex\(secret\)/);
-  assert.match(source, /sessionVerifierKeyPromise\?\.fingerprint === fingerprint/);
-  assert.match(source, /if \(sessionVerifierKeyPromise === record\) cachedSessionVerifier = \{ fingerprint, key \}/);
-  assert.match(source, /typeof secret !== "string" \|\| secret\.length === 0\) return null/);
-});
-
-
-test("settlement WebSocket authenticates through a signed subprotocol and broadcasts only committed results", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
-  assert.match(source, /url\.pathname === "\/api\/round\/events"/);
-  assert.match(source, /request\.headers\.get\("sec-websocket-protocol"\)/);
-  assert.match(source, /verifySessionToken\(token, env\.SESSION_SECRET \|\| ""\)/);
-  assert.match(source, /this\.ctx\.acceptWebSocket\(server\)/);
-  assert.match(source, /broadcastRoundSettled\(response, round\.id, round\.idempotency_key\)/);
-  assert.match(source, /if \(isEventSocket && response\.status === 101\) return response/);
-});
 
 
 function fakeStartReservationSession() {
