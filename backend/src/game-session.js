@@ -12,6 +12,7 @@ import {
   MAX_MULTIPLIER,
   PUBLIC_HISTORY_LIMIT,
   STARTING_GOLD,
+  calculatePayout,
   readRequestedMultiplierCents,
   resolveCashoutMultiplierCents
 } from "./game-rules.js";
@@ -423,15 +424,23 @@ export class GameSession {
     });
   }
 
+  async replayRoundStart(response) {
+    const active = this.getActiveRound();
+    if (active && active.id === response.round?.id) {
+      await this.ctx.storage.setAlarm(this.settlementAt(active));
+    }
+    return json({ ...response, serverTime: Date.now() });
+  }
+
   async startRound(body, idempotencyKey, receivedAtHeader = null) {
     // Let the core perform the standard key validation for malformed requests.
     if (!idempotencyKey || !/^[A-Za-z0-9_-]{16,100}$/.test(idempotencyKey)) {
-      return this.startRoundCore(body, idempotencyKey, receivedAtHeader);
+      return this.startRoundCore(body, idempotencyKey);
     }
     const cached = this.cachedIdempotent(idempotencyKey, "round-start");
-    if (cached) return json({ ...cached, serverTime: Date.now() });
+    if (cached) return this.replayRoundStart(cached);
     const existing = this.sql.exec("SELECT response_json FROM rounds WHERE idempotency_key=?", idempotencyKey).toArray()[0];
-    if (existing?.response_json) return json({ ...safeParse(existing.response_json, { error: "idempotency_replay" }), serverTime: Date.now() });
+    if (existing?.response_json) return this.replayRoundStart(safeParse(existing.response_json, { error: "idempotency_replay" }));
 
     // Reuse the same in-flight operation for retries with the same idempotency key.
     const pending = this.pendingStartPromises.get(idempotencyKey);
@@ -474,9 +483,9 @@ export class GameSession {
     // an intent associated with this same in-flight idempotency key.
     this.cleanupExpiredRecords();
     const cached = this.cachedIdempotent(idempotencyKey, "round-start");
-    if (cached) return json({ ...cached, serverTime: Date.now() });
+    if (cached) return this.replayRoundStart(cached);
     const existing = this.sql.exec("SELECT response_json FROM rounds WHERE idempotency_key=?", idempotencyKey).toArray()[0];
-    if (existing?.response_json) return json({ ...safeParse(existing.response_json, { error: "idempotency_replay" }), serverTime: Date.now() });
+    if (existing?.response_json) return this.replayRoundStart(safeParse(existing.response_json, { error: "idempotency_replay" }));
     if (state.gameOver) throw new ApiError(409, "game_over", "Start a new game before playing again.");
     if (state.waitingForLoan) throw new ApiError(409, "loan_decision_required", "Take a loan or end the game before starting another round.");
     if (!state.clientSeed) throw new ApiError(409, "client_seed_required", "Set a client seed before starting a round.");
@@ -503,7 +512,7 @@ export class GameSession {
     const roundPayload = { id: roundId, nonce, epoch, stake, startedAt, commitment: seedRow.commitment };
     let response;
     const duplicateAfterCrypto = this.cachedIdempotent(idempotencyKey, "round-start");
-    if (duplicateAfterCrypto) return json({ ...duplicateAfterCrypto, serverTime: Date.now() });
+    if (duplicateAfterCrypto) return this.replayRoundStart(duplicateAfterCrypto);
 
     this.ctx.storage.transactionSync(() => {
       // Recheck under the serialized SQLite transaction to reject concurrent starts.
@@ -566,6 +575,7 @@ export class GameSession {
         await this.ctx.storage.setAlarm(this.settlementAt({ started_at: startedAt, crash_point: crashPoint }));
       } catch (error) {
         logOperationalError("round_alarm_scheduling_failed", { roundId }, error);
+        throw new ApiError(503, "round_alarm_unavailable", "Retry this start with the same Idempotency-Key to confirm automatic settlement.");
       }
     } else {
       this.broadcastRoundSettled(response, roundId, idempotencyKey);
@@ -625,7 +635,7 @@ export class GameSession {
     // make a late cash-out win after the server has reached the committed crash point.
     const multiplierCents = resolveCashoutMultiplierCents(liveMultiplier, requestedMultiplierCents);
     const multiplier = multiplierCents / 100;
-    const payout = Math.floor(round.stake * multiplier);
+    const payout = calculatePayout(round.stake, multiplierCents);
     const settled = this.settleRound(round, state, "CASHED OUT", multiplier, payout, now);
     let response;
     this.ctx.storage.transactionSync(() => {
@@ -682,8 +692,9 @@ export class GameSession {
     const currentState = this.readState() || state;
     // An in-flight release that reaches the server at the x10 boundary still respects
     // the visible release cap. Automatic alarm settlement remains exactly x10.
-    const payoutMultiplier = resolveCashoutMultiplierCents(MAX_MULTIPLIER, requestedMultiplierCents) / 100;
-    const payout = Math.floor(round.stake * payoutMultiplier);
+    const multiplierCents = resolveCashoutMultiplierCents(MAX_MULTIPLIER, requestedMultiplierCents);
+    const payoutMultiplier = multiplierCents / 100;
+    const payout = calculatePayout(round.stake, multiplierCents);
     const settled = this.settleRound(round, currentState, "CASHED OUT", payoutMultiplier, payout, now);
     let response;
     this.ctx.storage.transactionSync(() => {

@@ -32,3 +32,8 @@ export function readRequestedMultiplierCents(body) {
   if (!body || !Object.prototype.hasOwnProperty.call(body, "requestedMultiplierCents")) return undefined;
   return validateRequestedMultiplierCents(body.requestedMultiplierCents);
 }
+
+
+export function calculatePayout(stake, multiplierCents) {
+  return Number(BigInt(stake) * BigInt(multiplierCents) / 100n);
+}

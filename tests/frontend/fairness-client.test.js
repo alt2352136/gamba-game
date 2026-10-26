@@ -32,3 +32,12 @@ test("browser fairness verifier reports a mismatching crash point", async () => 
   assert.equal(report.verifiedRounds, 0);
   assert.match(report.failures.join(" "), /crash point mismatch/);
 });
+
+
+test("browser fairness verifier rejects nonnumeric crash points", async () => {
+  for (const value of ["invalid", "NaN", "Infinity"]) {
+    const report = await verifyFairnessHistory(async () => apiResponse(value));
+    assert.equal(report.verifiedRounds, 0);
+    assert.match(report.failures.join(" "), /crash point mismatch/);
+  }
+});

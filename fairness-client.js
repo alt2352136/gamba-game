@@ -86,7 +86,8 @@ export async function verifyFairnessHistory(api, onProgress = () => {}) {
     if (cents < 100n) cents = 100n;
     if (cents > 100_000_000n) cents = 100_000_000n;
     const calculated = Number(cents) / 100;
-    if (Math.abs(calculated - Number(round.crash_point)) > 1e-9) failures.push(`Round ${round.id}: crash point mismatch`);
+    const recorded = Number(round.crash_point);
+    if (!Number.isFinite(recorded) || Math.abs(calculated - recorded) > 1e-9) failures.push(`Round ${round.id}: crash point mismatch`);
     else verifiedRounds += 1;
   }
 
