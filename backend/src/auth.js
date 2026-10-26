@@ -1,4 +1,4 @@
-import { base64url, fromBase64, hmacBytes, sha256Hex } from "./crypto-utils.js";
+import { base64url, hmacBytes, sha256Hex } from "./crypto-utils.js";
 
 export async function signedSessionToken(sessionId, secret) {
   const signature = await hmacBytes(new TextEncoder().encode(secret), sessionId);

@@ -76,3 +76,14 @@ test("an alarm after a round is already settled is a no-op", async () => {
   assert.equal(calls.capped, 0);
   assert.equal(calls.scheduled.length, 0);
 });
+
+
+test("replaying a round start restores its settlement alarm", async () => {
+  const round = { id: "retry-round", started_at: Date.now(), crash_point: 3 };
+  const { session, calls } = alarmHarness({ round });
+  const response = await GameSession.prototype.replayRoundStart.call(session, { round: { id: round.id } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls.scheduled, [session.settlementAt(round)]);
+  session.ctx.storage.setAlarm = async () => { throw new Error("storage unavailable"); };
+  await assert.rejects(GameSession.prototype.replayRoundStart.call(session, { round: { id: round.id } }));
+});
