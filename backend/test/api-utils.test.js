@@ -42,3 +42,19 @@ test("bounded JSON parser rejects oversized bodies while reading the stream", as
     return true;
   });
 });
+
+test("oversized streams are cancelled without waiting for the sender to finish", async () => {
+  let cancelled = false;
+  let pulls = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      controller.enqueue(new Uint8Array(32));
+    },
+    cancel() { cancelled = true; }
+  }, { highWaterMark: 0 });
+  await assert.rejects(readJsonLimited({ body, headers: new Headers() }, 16),
+    error => error instanceof ApiError && error.status === 413);
+  assert.equal(cancelled, true);
+  assert.equal(pulls, 1);
+});

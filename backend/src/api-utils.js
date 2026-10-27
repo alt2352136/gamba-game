@@ -31,9 +31,11 @@ export function safeParse(text, fallback) {
 
 export async function readJsonLimited(request, maxBytes = 8192) {
   const declaredLength = Number(request.headers.get("content-length") || 0);
-  let tooLarge = Number.isFinite(declaredLength) && declaredLength > maxBytes;
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    if (request.body) void request.body.cancel().catch(() => {});
+    throw new ApiError(413, "request_too_large", "Request body exceeds the allowed size.");
+  }
   if (!request.body) {
-    if (tooLarge) throw new ApiError(413, "request_too_large", "Request body exceeds the allowed size.");
     return {};
   }
 
@@ -46,17 +48,16 @@ export async function readJsonLimited(request, maxBytes = 8192) {
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
-        tooLarge = true;
-        chunks.length = 0;
-        continue; // Drain the remainder without buffering an oversized body.
+        // Stop consuming immediately; the sender may never finish its stream.
+        void reader.cancel().catch(() => {});
+        throw new ApiError(413, "request_too_large", "Request body exceeds the allowed size.");
       }
-      if (!tooLarge) chunks.push(value);
+      chunks.push(value);
     }
   } finally {
     reader.releaseLock();
   }
 
-  if (tooLarge) throw new ApiError(413, "request_too_large", "Request body exceeds the allowed size.");
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
